@@ -1,0 +1,13 @@
+# build artifacts
+build/
+*.3dsx
+*.elf
+*.smdh
+*.map
+*.t3x
+*.d
+*.o
+
+# tooling
+.vs/
+.vscode/
