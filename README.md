@@ -1,5 +1,10 @@
 # Booru3DS
 
+<p align="center">
+  <img src="assets/thumb.png" alt="Booru3DS banner" width="640"/>
+</p>
+
+
 A booru image board browser for the **Nintendo 3DS**, written in C with
 citro2d/citro3d. Browse Safebooru or Konachan, view images on the top
 screen, and save full-size originals to your SD card — or install them
