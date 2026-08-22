@@ -197,6 +197,9 @@ void dl_abort(dl_t *d)
     if (!d)
         return;
     if (d->easy) {
+        /* clear private so a pending DONE message for this handle
+           won't dereference freed memory on the next pump */
+        curl_easy_setopt(d->easy, CURLOPT_PRIVATE, NULL);
         if (s_multi)
             curl_multi_remove_handle(s_multi, d->easy);
         curl_easy_cleanup(d->easy);
