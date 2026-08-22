@@ -242,7 +242,12 @@ static bool net_soc_init(void)
     if (!s_soc)
         return false;
     memset(s_soc, 0, SOC_SIZE);
-    return R_SUCCEEDED(socInit(s_soc, SOC_SIZE));
+    if (R_FAILED(socInit(s_soc, SOC_SIZE))) {
+        free(s_soc);
+        s_soc = NULL;
+        return false;
+    }
+    return true;
 }
 
 int main(void)
