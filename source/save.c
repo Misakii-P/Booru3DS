@@ -242,13 +242,26 @@ static bool write_camera_jpeg(FILE *f, const unsigned char *jpg,
     unsigned char exif[280];
     size_t exiflen = build_exif(exif, dt);
 
-    /* JPEG: SOI(2) [APP0 JFIF] ...  Insert EXIF APP1 after APP0 if present,
-       otherwise right after SOI. 3DS camera is picky about order. */
+    /* JPEG: SOI(2) [APP0 JFIF] [APP1 old EXIF] ...  Insert new EXIF
+       after APP0, replacing any existing APP1 so ours is the first one
+       the camera sees. 3DS camera is picky about order and duplicates. */
     size_t ins = 2;
+    size_t copyFrom = 2;
     if (sz >= 6 && jpg[2] == 0xFF && jpg[3] == 0xE0) {
         unsigned int app0len = ((unsigned int)jpg[4] << 8) | jpg[5];
-        if (app0len >= 2 && 2 + 2 + app0len <= sz)
+        if (app0len >= 2 && 2 + 2 + app0len <= sz) {
             ins = 2 + 2 + app0len;
+            copyFrom = ins;
+            if (sz >= ins + 4 && jpg[ins] == 0xFF && jpg[ins+1] == 0xE1) {
+                unsigned int oldExifLen = ((unsigned int)jpg[ins+2] << 8) | jpg[ins+3];
+                if (oldExifLen >= 2 && ins + 2 + oldExifLen <= sz)
+                    copyFrom = ins + 2 + oldExifLen;
+            }
+        }
+    } else if (sz >= 4 && jpg[2] == 0xFF && jpg[3] == 0xE1) {
+        unsigned int oldExifLen = ((unsigned int)jpg[4] << 8) | jpg[5];
+        if (oldExifLen >= 2 && 2 + 2 + oldExifLen <= sz)
+            copyFrom = 2 + 2 + oldExifLen;
     }
     if (fwrite(jpg, 1, ins, f) != ins)
         return false;
@@ -259,7 +272,7 @@ static bool write_camera_jpeg(FILE *f, const unsigned char *jpg,
     };
     if (fwrite(hdr, 1, 3, f) != 3) return false;
     if (fwrite(exif, 1, exiflen, f) != exiflen) return false;
-    return fwrite(jpg + ins, 1, sz - ins, f) == sz - ins;
+    return fwrite(jpg + copyFrom, 1, sz - copyFrom, f) == sz - copyFrom;
 }
 
 /* decode ANY input and produce a small baseline jpeg the camera accepts.

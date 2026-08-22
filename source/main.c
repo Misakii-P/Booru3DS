@@ -52,6 +52,7 @@ static C3D_RenderTarget *s_top, *s_bot;
 
 static int do_search(void)
 {
+    if (g_searching) return -1;
     char enc[256];
     char url[512];
     u8 *buf = NULL;
