@@ -1,4 +1,4 @@
-# Booru3DS
+# Booru3DS (SFW Edition)
 
 <p align="center">
   <img src="assets/thumb.png" alt="Booru3DS banner" width="640"/>
@@ -63,6 +63,10 @@ few quirks apply. The 3DS Camera implementation is based on [SCR2JPG](https://gi
 
 That way, if one API falls or becomes outdated, the other serves as a backup.
 In this case, Konachan is the backup, as it holds less images than Safebooru.
+
+NO PLAN IS MADE TO SUPPORT OTHER PROVIDERS. We plan to keep this app fully SFW
+in order to comply with Universal-DB's guidelines. If you want to fork the repo 
+and add your own provider support; you're free to do so.
 
 ## Credits
 
