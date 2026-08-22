@@ -230,9 +230,10 @@ static void net_dns_init(void)
     fclose(f);
 }
 
-/* BSD socket service for libcurl */
+/* BSD socket service for libcurl - 512KB is plenty for 2 concurrent
+   16KB pumps and saves 512KB heap on OLD3DS (64MB total) */
 #define SOC_ALIGN 0x1000
-#define SOC_SIZE  0x100000
+#define SOC_SIZE  0x80000
 static u32 *s_soc = NULL;
 
 static bool net_soc_init(void)
@@ -264,7 +265,7 @@ int main(void)
 
     bgm_init();
     sfx_init();
-    if (!bgm_play("romfs:/bgm.wav"))
+    if (!bgm_play("romfs:/bgm.ogg"))
         snprintf(g_status, sizeof(g_status), "bgm not loaded");
 
     sdata_load();
