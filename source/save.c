@@ -242,16 +242,24 @@ static bool write_camera_jpeg(FILE *f, const unsigned char *jpg,
     unsigned char exif[280];
     size_t exiflen = build_exif(exif, dt);
 
-    if (fwrite(jpg, 1, 2, f) != 2)                    /* SOI */
+    /* JPEG: SOI(2) [APP0 JFIF] ...  Insert EXIF APP1 after APP0 if present,
+       otherwise right after SOI. 3DS camera is picky about order. */
+    size_t ins = 2;
+    if (sz >= 6 && jpg[2] == 0xFF && jpg[3] == 0xE0) {
+        unsigned int app0len = ((unsigned int)jpg[4] << 8) | jpg[5];
+        if (app0len >= 2 && 2 + 2 + app0len <= sz)
+            ins = 2 + 2 + app0len;
+    }
+    if (fwrite(jpg, 1, ins, f) != ins)
         return false;
     unsigned char hdr[3] = {
         0xE1,
         (unsigned char)(((exiflen + 2) >> 8) & 0xFF),
         (unsigned char)((exiflen + 2) & 0xFF),
     };
-    if (fwrite(hdr, 1, 3, f) != 3) return false;      /* APP1 marker + len */
+    if (fwrite(hdr, 1, 3, f) != 3) return false;
     if (fwrite(exif, 1, exiflen, f) != exiflen) return false;
-    return fwrite(jpg + 2, 1, sz - 2, f) == sz - 2;
+    return fwrite(jpg + ins, 1, sz - ins, f) == sz - ins;
 }
 
 /* decode ANY input and produce a small baseline jpeg the camera accepts.
@@ -352,10 +360,15 @@ static bool camera_encode(u8 *jpg, u32 sz, const char *path)
                 fclose(f);
             }
             /* the camera may fall back to the file's modification date:
-               stamp it explicitly so imported photos show download time */
+               stamp it explicitly so imported photos show download time.
+               time() can return -1 on 3DS if RTC is unset, which would
+               clamp to the FAT minimum (1980/2001) - use a sane fallback. */
             if (ok) {
+                time_t now = time(NULL);
+                if (now == (time_t)-1 || now < 1262304000)
+                    now = 1704067200; /* 2024-01-01 */
                 struct utimbuf ub;
-                ub.actime = ub.modtime = time(NULL);
+                ub.actime = ub.modtime = now;
                 utime(path, &ub);
             }
         }
