@@ -409,6 +409,30 @@ int main(void)
                 move_cursor(-PAGE_SIZE);
             if (kDown & KEY_R)
                 move_cursor(PAGE_SIZE);
+
+            /* Circle Pad (and New3DS C-Stick) */
+            circlePosition cpos;
+            hidCircleRead(&cpos);
+            if (abs(cpos.dx) > 55 || abs(cpos.dy) > 55) {
+                if (abs(cpos.dx) > abs(cpos.dy)) {
+                    if (cpos.dx > 55) move_cursor(1);
+                    else if (cpos.dx < -55) move_cursor(-1);
+                } else {
+                    if (cpos.dy > 55) move_cursor(-GRID_COLS);
+                    else if (cpos.dy < -55) move_cursor(GRID_COLS);
+                }
+            }
+            circlePosition cspos;
+            hidCstickRead(&cspos);
+            if (abs(cspos.dx) > 55 || abs(cspos.dy) > 55) {
+                if (abs(cspos.dx) > abs(cspos.dy)) {
+                    if (cspos.dx > 55) move_cursor(1);
+                    else if (cspos.dx < -55) move_cursor(-1);
+                } else {
+                    if (cspos.dy > 55) move_cursor(-GRID_COLS);
+                    else if (cspos.dy < -55) move_cursor(GRID_COLS);
+                }
+            }
         }
 
         thumbs_update(cursor);
