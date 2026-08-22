@@ -136,8 +136,15 @@ static bool in_rect(int px, int py, float x, float y, float w, float h)
     return px >= x && px < x + w && py >= y && py < y + h;
 }
 
+/* touch debounce: ignore taps faster than 100ms (prevents mass-touch OOM) */
+static u32 s_lastTouch = 0;
+
 static void handle_touch(int px, int py)
 {
+    u32 now = svcGetSystemTick() / 268123; /* ~ms, CPU 268MHz */
+    if (now - s_lastTouch < 100) return;
+    s_lastTouch = now;
+
     /* sound toggle, top-right on every screen */
     if (!g_searching &&
         in_rect(px, py, SND_BTN_X, SND_BTN_Y, SND_BTN_S, SND_BTN_S)) {
@@ -205,6 +212,12 @@ static void move_cursor(int delta)
 {
     if (post_count <= 0)
         return;
+    /* coalesce rapid DPad repeats */
+    static u32 lastMove = 0;
+    u32 now = svcGetSystemTick() / 268123;
+    if (now - lastMove < 80 && delta != 0) return;
+    lastMove = now;
+
     int c = cursor + delta;
     if (c < 0) c = 0;
     if (c > post_count - 1) c = post_count - 1;

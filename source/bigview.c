@@ -51,9 +51,13 @@ void bigview_request(int post)
 {
     if (s_big.want == post)
         return;
+    /* if a download is in flight, coalesce: just update want, let it
+       finish and the next pump will start the new one. Avoids abort churn
+       on mass touches. */
     if (s_big.dl) {
-        dl_abort(s_big.dl);
-        s_big.dl = NULL;
+        s_big.want = post;
+        s_big.failed = false;
+        return;
     }
     if (s_big.ready) {
         C3D_TexDelete(&s_big.tex);
