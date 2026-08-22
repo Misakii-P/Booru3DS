@@ -11,3 +11,12 @@ build/
 # tooling
 .vs/
 .vscode/
+
+# release artifacts
+builds/
+
+# generated graphics headers leaked to root
+/konachanbg.h
+/topscreenbg.h
+/topsearch.h
+/cam_test.jpg

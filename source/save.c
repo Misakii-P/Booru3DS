@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <utime.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <turbojpeg.h>
@@ -37,6 +38,16 @@ static struct
     u32 bytes;  /* booru: total written | camera: buffered download size */
     char path[256];
 } s = { SAVE_IDLE, SAVE_DEST_BOORU, NULL, NULL, 0, "" };
+
+/* latched on the first successful camera install of this session */
+static bool s_cam_notice = false;
+
+bool save_take_cam_notice(void)
+{
+    bool v = s_cam_notice;
+    s_cam_notice = false;
+    return v;
+}
 
 void save_init(void)
 {
@@ -154,6 +165,10 @@ static bool build_camera_path(char *out, int outsz)
 /* DateTimeOriginal), built big-endian and spliced after SOI           */
 /* ------------------------------------------------------------------ */
 
+/* EXIF layout v2: mirrors the SCR2JPG template (proven to be read by the
+   3DS camera) - IFD0 gains an Artist tag, SubIFD gains UserComment.
+   Offsets (tiff-relative): make=86 model=96 soft=110 dt=120 artist=140
+   subifd=156 dto=198 usercomment=218, payload total 233. */
 static size_t build_exif(unsigned char *b, const char *dt)
 {
     size_t p = 0;
@@ -170,44 +185,53 @@ static size_t build_exif(unsigned char *b, const char *dt)
     /* TIFF header, big-endian, IFD0 at offset 8 */
     P8('M'); P8('M'); P16(42); P32(8);
 
-    /* IFD0: 5 entries */
-    P16(5);
-    P16(0x010F); P16(2); P32(9);  P32(74);  /* Make     "Nintendo"     */
-    P16(0x0110); P16(2); P32(13); P32(84);  /* Model    "Nintendo 3DS" */
-    P16(0x0131); P16(2); P32(9);  P32(98);  /* Software "Booru3DS"     */
-    P16(0x0132); P16(2); P32(20); P32(108); /* DateTime                 */
-    P16(0x8769); P16(4); P32(1);  P32(128); /* Exif SubIFD              */
+    /* IFD0: 6 entries */
+    P16(6);
+    P16(0x010F); P16(2); P32(9);  P32(86);   /* Make     "Nintendo"       */
+    P16(0x0110); P16(2); P32(13); P32(96);   /* Model    "Nintendo 3DS"   */
+    P16(0x0131); P16(2); P32(9);  P32(110);  /* Software "Booru3DS"       */
+    P16(0x0132); P16(2); P32(20); P32(120);  /* DateTime                  */
+    P16(0x013B); P16(2); P32(16); P32(140);  /* Artist  "Booru3DS client" */
+    P16(0x8769); P16(4); P32(1);  P32(156);  /* Exif SubIFD               */
     P32(0);
 
     /* data area, offsets relative to TIFF start */
-    memcpy(b + p, "Nintendo\0", 9);      p += 9;   /* 74..82  */
-    P8(0);                                          /* pad 83  */
-    memcpy(b + p, "Nintendo 3DS\0", 13); p += 13;   /* 84..96  */
-    P8(0);                                          /* pad 97  */
-    memcpy(b + p, "Booru3DS\0", 9);      p += 9;   /* 98..106 */
-    P8(0);                                          /* pad 107 */
+    memcpy(b + p, "Nintendo\0", 9);      p += 9;   /*  86..94 */
+    P8(0);                                          /*  95     */
+    memcpy(b + p, "Nintendo 3DS\0", 13); p += 13;   /*  96..108*/
+    P8(0);                                          /* 109     */
+    memcpy(b + p, "Booru3DS\0", 9);      p += 9;   /* 110..118*/
+    P8(0);                                          /* 119     */
 
-    memcpy(b + p, dt, 20);               p += 20;  /* 108..127 */
+    memcpy(b + p, dt, 20);               p += 20;  /* 120..139*/
 
-    /* 128: SubIFD, 2 entries */
-    P16(2);
+    memcpy(b + p, "Booru3DS client", 15); p += 15;  /* 140..154*/
+    P8(0);                                          /* 155     */
+
+    /* 156: SubIFD, 3 entries */
+    P16(3);
     P16(0x9000); P16(7); P32(4);
     P8('0'); P8('2'); P8('3'); P8('0');             /* ExifVersion inline */
-    P16(0x9003); P16(2); P32(20); P32(158);         /* DateTimeOriginal   */
+    P16(0x9003); P16(2); P32(20); P32(198);         /* DateTimeOriginal   */
+    P16(0x9286); P16(7); P32(9); P32(218);          /* UserComment        */
     P32(0);
 
-    memcpy(b + p, dt, 20);               p += 20;  /* 158..177 */
+    memcpy(b + p, dt, 20);               p += 20;  /* 198..217 */
+
+    /* 218: UserComment = charset header + value */
+    memcpy(b + p, "ASCII\0\0\0", 8);     p += 8;   /* 218..225 */
+    P8('1');                                         /* 226     */
 
 #undef P8
 #undef P16
 #undef P32
-    return p; /* 184 */
+    return p; /* 233 */
 }
 
 static bool write_camera_jpeg(FILE *f, const unsigned char *jpg,
                               unsigned long sz)
 {
-    char dt[20] = "2026:01:01 00:00:00";
+    char dt[64] = "2026:01:01 00:00:00";
     time_t t = time(NULL);
     struct tm *tmv = localtime(&t);
     if (tmv && tmv->tm_year >= 110)
@@ -215,7 +239,7 @@ static bool write_camera_jpeg(FILE *f, const unsigned char *jpg,
                  tmv->tm_year + 1900, tmv->tm_mon + 1, tmv->tm_mday,
                  tmv->tm_hour, tmv->tm_min, tmv->tm_sec);
 
-    unsigned char exif[256];
+    unsigned char exif[280];
     size_t exiflen = build_exif(exif, dt);
 
     if (fwrite(jpg, 1, 2, f) != 2)                    /* SOI */
@@ -273,6 +297,17 @@ static bool camera_encode(u8 *jpg, u32 sz, const char *path)
     } else {
         /* png/bmp/etc via stb_image, then shrink to fit 640x480 */
         int comp = 0;
+
+        /* header pre-check: refuse monsters BEFORE stb tries to allocate
+           W*H*4 bytes (a 4500px wallpaper would attempt ~56MB) */
+        {
+            int pw = 0, ph = 0, pc = 0;
+            if (!stbi_info_from_memory(jpg, (int)sz, &pw, &ph, &pc) ||
+                pw <= 0 || ph <= 0 ||
+                (long long)pw * ph > 10000000LL)
+                return false;
+        }
+
         u8 *src = stbi_load_from_memory(jpg, (int)sz, &W, &H, &comp, 4);
         if (!src || W <= 0 || H <= 0) {
             free(src);
@@ -315,6 +350,13 @@ static bool camera_encode(u8 *jpg, u32 sz, const char *path)
             if (f) {
                 ok = write_camera_jpeg(f, out, outsize);
                 fclose(f);
+            }
+            /* the camera may fall back to the file's modification date:
+               stamp it explicitly so imported photos show download time */
+            if (ok) {
+                struct utimbuf ub;
+                ub.actime = ub.modtime = time(NULL);
+                utime(path, &ub);
             }
         }
         tjFree(out);
@@ -420,6 +462,8 @@ void save_pump(void)
         if (!ok)
             remove(s.path); /* don't leave a broken photo in the roll */
         s.st = ok ? SAVE_OK : SAVE_ERR;
+        if (ok)
+            s_cam_notice = true;
     } else if (r == DL_ERR) {
         finish(false);
         s.st = SAVE_ERR;

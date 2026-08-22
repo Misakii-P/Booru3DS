@@ -13,9 +13,10 @@
 #include "thumbs.h"
 #include "bigview.h"
 #include "save.h"
-#include "save.h"
+#include "sdata.h"
 #include "ui.h"
 #include "bgm.h"
+#include "sfx.h"
 
 /* ------------------------------------------------------------------ */
 /* state                                                               */
@@ -37,6 +38,11 @@ static int pv = 0;
 const char *g_provider_name = PV_NAMES[0];
 int g_provider = 0;
 bool g_save_prompt = false;
+bool g_about_open = false;
+bool g_camwarn_open = false;
+bool g_searching = false;
+bool g_hist_open = false;
+int g_hist_sel = 0;
 
 static C3D_RenderTarget *s_top, *s_bot;
 
@@ -50,6 +56,8 @@ static int do_search(void)
     char url[512];
     u8 *buf = NULL;
     u32 size = 0;
+
+    g_searching = true;
 
     /* free sockets so the search request has a clean connection */
     thumbs_suspend();
@@ -76,6 +84,7 @@ static int do_search(void)
         cursor = 0;
         snprintf(g_status, sizeof(g_status), "fail(%08lx) http:%lu %s",
                  (unsigned long)res, (unsigned long)g_http, net_err());
+        g_searching = false;
         render_frame();
         return -1;
     }
@@ -88,6 +97,9 @@ static int do_search(void)
     thumbs_reset();
     bigview_reset();
     save_reset();
+    bigview_request(cursor);
+    sdata_hist_push(current_tags);
+    g_searching = false;
 
     if (post_count == 0)
         snprintf(g_status, sizeof(g_status), "no results");
@@ -125,18 +137,48 @@ static bool in_rect(int px, int py, float x, float y, float w, float h)
 
 static void handle_touch(int px, int py)
 {
-    if (screen == SCR_HOME) {
-        if (in_rect(px, py, 40, 104, 240, 40))
-            prompt_search();
+    /* sound toggle, top-right on every screen */
+    if (!g_searching &&
+        in_rect(px, py, SND_BTN_X, SND_BTN_Y, SND_BTN_S, SND_BTN_S)) {
+        sfx_click();
+        bgm_set_on(!bgm_on());
         return;
     }
 
+    /* title screen: corner buttons + search bar */
+    if (screen == SCR_HOME && !g_searching) {
+        if (in_rect(px, py, HIST_BTN_X, HIST_BTN_Y, HIST_BTN_S, HIST_BTN_S)) {
+            sfx_click();
+            g_hist_sel = 0;
+            g_hist_open = true;
+            return;
+        }
+        if (in_rect(px, py, ABOUT_BTN_X, ABOUT_BTN_Y, ABOUT_BTN_S,
+                    ABOUT_BTN_S)) {
+            sfx_click();
+            g_about_open = true;
+            return;
+        }
+        if (in_rect(px, py, 40, 104, 228, 40)) {
+            sfx_click();
+            prompt_search();
+            return;
+        }
+        return;
+    }
+
+    if (screen == SCR_LIST && g_searching)
+        return;
+
+    /* results screen: top bar (home + search) then the grid */
     if (in_rect(px, py, HOME_BTN_X, HOME_BTN_Y, HOME_BTN_S, HOME_BTN_S)) {
+        sfx_click();
         go_home();
         return;
     }
     if (in_rect(px, py, SBAR_LX, SBAR_TY, SBAR_RX - SBAR_LX,
                 SBAR_BY - SBAR_TY)) {
+        sfx_click();
         prompt_search();
         return;
     }
@@ -148,6 +190,7 @@ static void handle_touch(int px, int py)
             int first_page = (cursor / PAGE_SIZE) * PAGE_SIZE;
             int i = first_page + row * GRID_COLS + col;
             if (i < post_count && i != cursor) {
+                sfx_click(); /* art touched */
                 cursor = i;
                 bigview_request(cursor);
             }
@@ -220,8 +263,16 @@ int main(void)
         snprintf(g_status, sizeof(g_status), "soc init failed");
 
     bgm_init();
+    sfx_init();
     if (!bgm_play("romfs:/bgm.wav"))
         snprintf(g_status, sizeof(g_status), "bgm not loaded");
+
+    sdata_load();
+    pv = sdata_provider();
+    if (pv < 0 || pv >= PV_COUNT)
+        pv = 0;
+    g_provider = pv;
+    g_provider_name = PV_NAMES[pv];
 
     render_frame();
 
@@ -229,7 +280,12 @@ int main(void)
         hidScanInput();
         u32 kDown = hidKeysDown();
 
-        if (g_save_prompt) {
+        if (g_camwarn_open) {
+            /* first camera-install notice: anything dismisses it */
+            if (kDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_START |
+                         KEY_SELECT | KEY_TOUCH))
+                g_camwarn_open = false;
+        } else if (g_save_prompt) {
             /* save-destination dialog */
             if (kDown & KEY_A) {
                 g_save_prompt = false;
@@ -239,6 +295,50 @@ int main(void)
                 save_request(cursor, SAVE_DEST_CAMERA);
             } else if (kDown & KEY_B) {
                 g_save_prompt = false;
+            }
+        } else if (g_about_open) {
+            /* about popup: any button or tap dismisses it */
+            if (kDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_START |
+                         KEY_SELECT | KEY_TOUCH))
+                g_about_open = false;
+        } else if (g_hist_open) {
+            /* search-history overlay */
+            int n = sdata_hist_count();
+            if (n > 0) {
+                if ((kDown & KEY_DUP) && g_hist_sel > 0)
+                    g_hist_sel--;
+                if ((kDown & KEY_DDOWN) && g_hist_sel < n - 1)
+                    g_hist_sel++;
+                if (kDown & KEY_A) {
+                    strncpy(current_tags, sdata_hist_get(g_hist_sel),
+                            sizeof(current_tags) - 1);
+                    current_tags[sizeof(current_tags) - 1] = 0;
+                    g_hist_open = false;
+                    do_search();
+                }
+            }
+            if (kDown & (KEY_B | KEY_START))
+                g_hist_open = false;
+
+            if (kDown & KEY_TOUCH) {
+                touchPosition tp;
+                hidTouchRead(&tp);
+                /* tap a row to search it; anywhere else closes.
+                   geometry must mirror draw_hist_overlay(): rows start at
+                   panel.y + 34, 18px pitch */
+                float ry0 = 30.0f + 34.0f;
+                int row = (int)((tp.py - ry0) / 18.0f);
+                if (tp.px >= 20 && tp.px <= 300 && row >= 0 && row < n &&
+                    tp.py >= ry0 && tp.py < ry0 + n * 18.0f) {
+                    g_hist_sel = row;
+                    strncpy(current_tags, sdata_hist_get(row),
+                            sizeof(current_tags) - 1);
+                    current_tags[sizeof(current_tags) - 1] = 0;
+                    g_hist_open = false;
+                    do_search();
+                } else if (!in_rect(tp.px, tp.py, 20, 30, 280, 190)) {
+                    g_hist_open = false;
+                }
             }
         } else {
             if (kDown & KEY_START)
@@ -250,6 +350,11 @@ int main(void)
             if (kDown & KEY_X)
                 prompt_search();
 
+            if ((kDown & KEY_Y) && sdata_hist_count() > 0) {
+                g_hist_sel = 0;
+                g_hist_open = true;
+            }
+
             if ((kDown & KEY_B) && screen == SCR_LIST)
                 go_home();
 
@@ -257,6 +362,7 @@ int main(void)
                 pv = (pv + 1) % PV_COUNT;
                 g_provider = pv;
                 g_provider_name = PV_NAMES[pv];
+                sdata_set_provider(pv);
                 current_tags[0] = 0;
                 screen = SCR_HOME;
                 thumbs_reset();
@@ -288,6 +394,11 @@ int main(void)
         thumbs_update(cursor);
         bigview_pump();
         save_pump();
+        if (save_take_cam_notice() && !sdata_cam_warn()) {
+            sdata_set_cam_warn();
+            g_camwarn_open = true;
+            sfx_alert();
+        }
         bgm_update();
         render_frame();
         gspWaitForVBlank();
@@ -297,6 +408,7 @@ int main(void)
     thumbs_exit();
     bigview_reset();
     save_exit();
+    sfx_exit();
     ui_exit();
     C2D_Fini();
     C3D_Fini();

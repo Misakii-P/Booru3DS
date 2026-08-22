@@ -7,3 +7,5 @@ void bgm_exit(void);
 bool bgm_play(const char *path); /* wav file, loops forever */
 void bgm_stop(void);
 void bgm_update(void);           /* call once per frame */
+void bgm_set_on(bool on);        /* mute/unmute bgm only (channel 0) */
+bool bgm_on(void);

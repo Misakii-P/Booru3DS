@@ -1,7 +1,8 @@
 #pragma once
 #include <stddef.h>
 
-#define MAX_POSTS 50
+/* both APIs cap limit= at 100 per request */
+#define MAX_POSTS 100
 
 typedef struct {
     unsigned int id;

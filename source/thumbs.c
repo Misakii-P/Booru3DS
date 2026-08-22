@@ -11,6 +11,7 @@
 #include "net.h"
 #include "posts.h"
 #include "imgtex.h"
+#include "bigview.h"
 #include "thumbs.h"
 
 #define THUMB_MAX_DIM 112
@@ -231,8 +232,8 @@ void thumbs_update(int cursor)
         s->stamp = s_frame;
     }
 
-    /* start next download if none in flight */
-    if (!find_state(T_ACTIVE)) {
+    /* start next download if none in flight; the big view wins bandwidth */
+    if (!find_state(T_ACTIVE) && !bigview_busy()) {
         Slot *nextq = find_state(T_QUEUE);
         if (nextq) {
             char url[512];

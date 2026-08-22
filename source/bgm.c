@@ -19,6 +19,7 @@
 static FILE *s_file;
 static bool s_playing;
 static bool s_ndsp_ok;
+static bool s_on = true;
 static u32 s_totalRead;
 static u32 s_dataSize;
 static u32 s_dataOffset;
@@ -176,9 +177,29 @@ void bgm_stop(void)
     }
 }
 
+void bgm_set_on(bool on)
+{
+    if (!s_ndsp_ok || on == s_on)
+        return;
+    s_on = on;
+
+    /* muting only touches channel 0: any future effect channels are
+       completely independent */
+    if (!on) {
+        ndspChnWaveBufClear(0);
+        for (int i = 0; i < NUM_BUFFERS; i++)
+            s_waveBufs[i].status = NDSP_WBUF_DONE;
+    }
+}
+
+bool bgm_on(void)
+{
+    return s_on;
+}
+
 void bgm_update(void)
 {
-    if (!s_playing || !s_file)
+    if (!s_playing || !s_file || !s_on)
         return;
 
     for (int i = 0; i < NUM_BUFFERS; i++) {

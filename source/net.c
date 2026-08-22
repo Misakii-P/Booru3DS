@@ -32,10 +32,12 @@ static void curl_ensure(void)
 struct dl_s
 {
     CURL *easy;
+    long code;
     u8 *buf;
     u32 size, cap;
     bool done;
     bool failed;
+    char err[CURL_ERROR_SIZE];
 };
 
 static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
@@ -64,6 +66,7 @@ static void set_common_opts(CURL *e, dl_t *d)
 {
     curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(e, CURLOPT_WRITEDATA, d);
+    curl_easy_setopt(e, CURLOPT_ERRORBUFFER, d ? d->err : NULL);
     curl_easy_setopt(e, CURLOPT_USERAGENT, HTTP_USER_AGENT);
     curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(e, CURLOPT_SSL_VERIFYPEER, 0L);
@@ -133,15 +136,15 @@ int dl_pump(dl_t *d)
             if (fd) {
                 fd->done = true;
                 fd->failed = msg->data.result != CURLE_OK;
+                curl_easy_getinfo(msg->easy_handle,
+                                  CURLINFO_RESPONSE_CODE, &fd->code);
             }
             curl_multi_remove_handle(s_multi, msg->easy_handle);
         }
     }
 
     if (d->done) {
-        long code = 0;
-        curl_easy_getinfo(d->easy, CURLINFO_RESPONSE_CODE, &code);
-        if (!d->failed && code == 200)
+        if (!d->failed && d->code == 200)
             return DL_DONE;
         return DL_ERR;
     }
@@ -163,6 +166,18 @@ const char *net_err(void)
 u32 dl_size(const dl_t *d)
 {
     return d ? d->size : 0;
+}
+
+long dl_code(const dl_t *d)
+{
+    return d ? d->code : 0;
+}
+
+const char *dl_err(const dl_t *d)
+{
+    if (!d || !d->err[0])
+        return "unknown error";
+    return d->err;
 }
 
 void dl_consume(dl_t *d, u32 n)
@@ -221,7 +236,8 @@ Result download(const char *url, u8 **out_buf, u32 *out_size, u32 *status_out)
     curl_ensure();
 
     Result ret = -3;
-    dl_t tmp = { NULL, NULL, 0, 0, false, false };
+    dl_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
     tmp.cap = 32 * 1024;
     tmp.buf = (u8 *)malloc(tmp.cap);
 

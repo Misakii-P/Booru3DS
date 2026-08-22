@@ -8,6 +8,7 @@
 #include <turbojpeg.h>
 
 #include "net.h"
+#include <curl/curl.h>
 #include "posts.h"
 #include "imgtex.h"
 #include "bigview.h"
@@ -126,6 +127,23 @@ static bool decode_big(u8 *jpg, u32 sz, C3D_Tex *tex, Tex3DS_SubTexture *sub)
     return ok;
 }
 
+bool bigview_busy(void)
+{
+    return s_big.dl != NULL;
+}
+
+bool bigview_failed(void)
+{
+    return s_big.failed;
+}
+
+const char *g_big_err = "";
+
+u32 bigview_bytes(void)
+{
+    return s_big.dl ? dl_size(s_big.dl) : 0;
+}
+
 void bigview_pump(void)
 {
     if (post_count <= 0 || s_big.want < 0 || s_big.want >= post_count)
@@ -149,16 +167,27 @@ void bigview_pump(void)
     if (s_big.dl) {
         int r = dl_pump(s_big.dl);
         if (r == DL_DONE) {
+            long code = 0;
+            code = dl_code(s_big.dl);
             u8 *buf = (u8 *)dl_buf(s_big.dl);
             u32 sz = dl_size(s_big.dl);
             bool ok = sz >= 16 &&
                       decode_big(buf, sz, &s_big.tex, &s_big.sub);
+            static char errbuf[192];
+            if (!ok)
+                snprintf(errbuf, sizeof(errbuf), "%s (http %ld%s)",
+                         dl_err(s_big.dl), code,
+                         sz < 16 ? ", empty" : "");
+            g_big_err = errbuf;
             dl_abort(s_big.dl);
             s_big.dl = NULL;
             s_big.post = ok ? s_big.want : -1;
             s_big.ready = ok;
             s_big.failed = !ok;
         } else if (r == DL_ERR) {
+            static char errbuf[192];
+            snprintf(errbuf, sizeof(errbuf), "%s", dl_err(s_big.dl));
+            g_big_err = errbuf;
             dl_abort(s_big.dl);
             s_big.dl = NULL;
             s_big.failed = true;
