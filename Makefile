@@ -11,6 +11,9 @@ include $(DEVKITARM)/3ds_rules
 
 #---------------------------------------------------------------------------------
 TARGET		:=	booru3ds
+APP_TITLE	:=	Booru3DS
+APP_AUTHOR	:=	MisakiP_ / Misakii-P
+APP_DESCRIPTION	:=	SFW Booru API image board explorer for 3DS.
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
