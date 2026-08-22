@@ -24,7 +24,7 @@ straight into the Nintendo 3DS Camera app.
 - **Install to 3DS Camera** (`A` -> `X`) — converts any downloaded image
   into a photo the Nintendo 3DS Camera app displays natively, complete
   with EXIF timestamps.
-- **Search history** — Up to 10 queries can be saved on the search history.
+- **Search history** — Up to 8 queries can be saved on the search history.
   these remain on next boot, and can be opened anytime with Y
 
 ## Controls
@@ -70,7 +70,3 @@ In this case, Konachan is the backup, as it holds less images than Safebooru.
   DCIM conventions that make the camera accept imported photos.
 - [stb_image](https://github.com/nothings/stb) — PNG/BMP decoding.
 - devkitPro, libctru, citro2d/citro3d, libjpeg-turbo, cURL/mbedTLS.
-
-## License
-
-MIT
