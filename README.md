@@ -1,4 +1,4 @@
-# Booru3DS (SFW Edition)
+# Booru3DS (SFW)
 
 <p align="center">
   <img src="assets/thumb.png" alt="Booru3DS banner" width="640"/>
