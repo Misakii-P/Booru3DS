@@ -16,7 +16,7 @@
 
 /* hard cap per buffered transfer (save streams via dl_consume, so it never
    comes close); full-size file_url images are written to SD incrementally */
-#define DL_MAX_BUF (8 * 1024 * 1024)
+#define DL_MAX_BUF (4 * 1024 * 1024)
 
 static CURLM *s_multi = NULL;
 static bool s_global = false;
@@ -125,7 +125,12 @@ int dl_pump(dl_t *d)
         return d->failed ? DL_ERR : DL_DONE;
 
     int running = 0;
-    curl_multi_perform(s_multi, &running);
+    /* pump multiple times per frame to keep curl progressing on slow CPUs */
+    for (int i = 0; i < 3; i++) {
+        curl_multi_perform(s_multi, &running);
+        if (running == 0)
+            break;
+    }
 
     CURLMsg *msg;
     int msgs_left = 0;
@@ -186,10 +191,31 @@ void dl_consume(dl_t *d, u32 n)
         return;
     if (n >= d->size) {
         d->size = 0;
+        /* shrink buffer to free heap after streaming is done */
+        if (d->cap > 64 * 1024) {
+            u8 *shrunk = (u8 *)realloc(d->buf, 32 * 1024);
+            if (shrunk) {
+                d->buf = shrunk;
+                d->cap = 32 * 1024;
+            }
+        }
         return;
     }
     memmove(d->buf, d->buf + n, d->size - n);
     d->size -= n;
+    /* shrink if buffer is mostly empty */
+    if (d->size > 0 && d->cap > 64 * 1024 && d->size < d->cap / 4) {
+        u32 new_cap = d->cap / 2;
+        if (new_cap < d->size * 2)
+            new_cap = d->size * 2;
+        if (new_cap < 32 * 1024)
+            new_cap = 32 * 1024;
+        u8 *shrunk = (u8 *)realloc(d->buf, new_cap);
+        if (shrunk) {
+            d->buf = shrunk;
+            d->cap = new_cap;
+        }
+    }
 }
 
 void dl_abort(dl_t *d)

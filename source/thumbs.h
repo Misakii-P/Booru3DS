@@ -12,3 +12,4 @@ void thumbs_suspend(void); /* abort in-flight transfer, keep ready thumbs */
 void thumbs_update(int cursor);
 bool thumb_get(int post, C3D_Tex **tex, const Tex3DS_SubTexture **sub);
 void thumbs_stats(int *ok, int *pending);
+bool thumbs_page_ready(int cursor);

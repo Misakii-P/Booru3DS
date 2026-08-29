@@ -338,7 +338,8 @@ static void draw_hist_overlay(void)
                                   COL_SEL);
             draw_text_d(px + 12, ry, 0.42f,
                         i == g_hist_sel ? COL_TEXT : COL_DIM,
-                        C2D_AlignLeft, 0.9f, "%.34s", sdata_hist_get(i));
+                        C2D_AlignLeft, 0.9f, "%.34s",
+                        sdata_hist_get(i) ? sdata_hist_get(i) : "");
         }
     }
 
@@ -386,10 +387,8 @@ static void render_top(void)
                   "%s", g_status[0] ? g_status : "loading...");
     }
 
-    int ok = 0, pend = 0;
-    thumbs_stats(&ok, &pend);
     draw_text(4, 4, 0.32f, COL_DIM, C2D_AlignLeft,
-              "%d/%d", ok, post_count);
+              "%d/%d", cursor + 1, post_count);
 }
 
 static void draw_cell(int idx, float x, float y, bool sel)

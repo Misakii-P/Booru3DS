@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 #include <3ds.h>
 #include <citro3d.h>
@@ -15,7 +16,7 @@
 #include "thumbs.h"
 
 #define THUMB_MAX_DIM 112
-#define MAX_THUMBS    30
+#define MAX_THUMBS    12
 
 typedef enum { T_EMPTY, T_QUEUE, T_ACTIVE, T_READY, T_FAIL } TState;
 
@@ -32,6 +33,7 @@ typedef struct
 static Slot s_slots[MAX_THUMBS];
 static u32 s_frame = 1;
 static int s_ok = 0;
+static int s_page = -1;
 
 void thumbs_init(void) {}
 void thumbs_exit(void) {}
@@ -47,6 +49,7 @@ void thumbs_reset(void)
         memset(s, 0, sizeof(*s));
     }
     s_ok = 0;
+    s_page = -1;
 }
 
 bool thumb_get(int post, C3D_Tex **tex, const Tex3DS_SubTexture **sub)
@@ -163,14 +166,6 @@ static Slot *alloc_slot(void)
     return victim;
 }
 
-static Slot *find_state(TState st)
-{
-    for (int i = 0; i < MAX_THUMBS; i++)
-        if (s_slots[i].st == st)
-            return &s_slots[i];
-    return NULL;
-}
-
 static Slot *find_slot(int post)
 {
     for (int i = 0; i < MAX_THUMBS; i++)
@@ -179,13 +174,23 @@ static Slot *find_slot(int post)
     return NULL;
 }
 
+static Slot *find_state(TState st)
+{
+    for (int i = 0; i < MAX_THUMBS; i++)
+        if (s_slots[i].st == st)
+            return &s_slots[i];
+    return NULL;
+}
+
 void thumbs_suspend(void)
 {
-    Slot *s = find_state(T_ACTIVE);
-    if (s && s->dl) {
-        dl_abort(s->dl);
-        s->dl = NULL;
-        s->st = T_QUEUE; /* retry later */
+    for (int i = 0; i < MAX_THUMBS; i++) {
+        Slot *s = &s_slots[i];
+        if (s->st == T_ACTIVE && s->dl) {
+            dl_abort(s->dl);
+            s->dl = NULL;
+            s->st = T_QUEUE;
+        }
     }
 }
 
@@ -196,50 +201,70 @@ void thumbs_update(int cursor)
     if (post_count <= 0)
         return;
 
-    /* desired set: cursor first, then outward; current page + next page */
-    int first_page = (cursor / PAGE_SIZE) * PAGE_SIZE;
-    int last_page = first_page + 2 * PAGE_SIZE;
-    if (last_page > post_count)
-        last_page = post_count;
+    /* current page only */
+    int cur_page = (cursor / PAGE_SIZE) * PAGE_SIZE;
+    int page_end = cur_page + PAGE_SIZE;
+    if (page_end > post_count)
+        page_end = post_count;
 
-    int want[2 * PAGE_SIZE];
-    int nwant = 0;
-    want[nwant++] = cursor;
-    for (int k = 1; k < 2 * PAGE_SIZE && nwant < 2 * PAGE_SIZE; k++) {
-        if (cursor - k >= first_page)
-            want[nwant++] = cursor - k;
-        if (nwant < 2 * PAGE_SIZE && cursor + k < last_page)
-            want[nwant++] = cursor + k;
+    /* page changed: abort all downloads and reset page tracking.
+       don't delete textures here — let alloc_slot evict them one at a
+       time so linear memory stays stable on old3ds. */
+    if (cur_page != s_page) {
+        for (int i = 0; i < MAX_THUMBS; i++) {
+            Slot *s = &s_slots[i];
+            if (s->st == T_ACTIVE && s->dl) {
+                dl_abort(s->dl);
+                s->dl = NULL;
+                s->st = T_EMPTY;
+            }
+        }
+        s_ok = 0;
+        s_page = cur_page;
     }
 
-    /* touch wanted ready slots so they survive eviction */
-    for (int i = 0; i < nwant; i++) {
-        Slot *s = find_slot(want[i]);
-        if (s)
-            s->stamp = s_frame;
+    /* retry failed thumbnails after a delay (5 seconds) */
+    for (int i = 0; i < MAX_THUMBS; i++) {
+        Slot *s = &s_slots[i];
+        if (s->st == T_FAIL && s_frame - s->stamp > 300)
+            s->st = T_QUEUE;
     }
 
-    /* queue missing ones */
-    for (int i = 0; i < nwant; i++) {
-        if (find_slot(want[i]))
+    /* queue missing ones for the current page */
+    for (int i = cur_page; i < page_end; i++) {
+        if (find_slot(i))
             continue;
         Slot *s = alloc_slot();
         if (!s)
             break;
         memset(s, 0, sizeof(*s));
-        s->post = want[i];
+        s->post = i;
         s->st = T_QUEUE;
         s->stamp = s_frame;
     }
 
-    /* start next download if none in flight; the big view wins bandwidth */
+    /* start next download (single download, prioritise cursor) */
     if (!find_state(T_ACTIVE) && !bigview_busy()) {
-        Slot *nextq = find_state(T_QUEUE);
+        Slot *nextq = NULL;
+        int best_dist = INT_MAX;
+        for (int i = 0; i < MAX_THUMBS; i++) {
+            Slot *s = &s_slots[i];
+            if (s->st != T_QUEUE)
+                continue;
+            int dist = s->post - cursor;
+            if (dist < 0) dist = -dist;
+            if (dist < best_dist) {
+                best_dist = dist;
+                nextq = s;
+            }
+        }
         if (nextq) {
             char url[512];
             build_url(nextq->post, url, sizeof(url));
             nextq->dl = dl_start(url);
             nextq->st = nextq->dl ? T_ACTIVE : T_FAIL;
+            if (!nextq->dl)
+                nextq->stamp = s_frame;
         }
     }
 
@@ -251,15 +276,32 @@ void thumbs_update(int cursor)
             u8 *buf = (u8 *)dl_buf(act->dl);
             u32 sz = dl_size(act->dl);
             bool ok = sz >= 16 && decode_thumb(buf, sz, &act->tex, &act->sub);
-            dl_abort(act->dl); /* frees buffer + struct */
+            dl_abort(act->dl);
             act->dl = NULL;
             act->st = ok ? T_READY : T_FAIL;
             if (ok)
                 s_ok++;
+            else
+                act->stamp = s_frame;
         } else if (r == DL_ERR) {
             dl_abort(act->dl);
             act->dl = NULL;
             act->st = T_FAIL;
+            act->stamp = s_frame;
         }
     }
+}
+
+bool thumbs_page_ready(int cursor)
+{
+    int first = (cursor / PAGE_SIZE) * PAGE_SIZE;
+    int end = first + PAGE_SIZE;
+    if (end > post_count)
+        end = post_count;
+    for (int i = first; i < end; i++) {
+        Slot *s = find_slot(i);
+        if (!s || s->st != T_READY)
+            return false;
+    }
+    return true;
 }

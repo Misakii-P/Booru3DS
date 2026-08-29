@@ -132,7 +132,8 @@ void sfx_init(void)
 void sfx_exit(void)
 {
     for (int i = 0; i < SFX_COUNT; i++) {
-        ndspChnWaveBufClear(SFX_CH[i]);
+        if (s_v[i].ok)
+            ndspChnWaveBufClear(SFX_CH[i]);
         if (s_v[i].data) {
             linearFree(s_v[i].data);
             s_v[i].data = NULL;

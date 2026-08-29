@@ -43,7 +43,7 @@ void sdata_load(void)
     fclose(f);
 
     /* clamp to a valid provider index (crash-proof against corrupt saves) */
-    if (s.provider < 0 || s.provider > 15)
+    if (s.provider < 0 || s.provider >= 2)
         s.provider = 0;
 }
 

@@ -26,7 +26,7 @@ int cursor = 0;
 char current_tags[128] = "";
 Screen screen = SCR_HOME;
 
-char g_status[128] = "";
+char g_status[256] = "";
 unsigned long g_res = 0, g_http = 0, g_size = 0;
 
 /* API providers: safebooru (gelbooru dapi) works from emulators with a PC
@@ -50,13 +50,13 @@ static C3D_RenderTarget *s_top, *s_bot;
 /* actions                                                             */
 /* ------------------------------------------------------------------ */
 
+static dl_t *s_search_dl = NULL;
+
 static int do_search(void)
 {
     if (g_searching) return -1;
-    char enc[256];
-    char url[512];
-    u8 *buf = NULL;
-    u32 size = 0;
+    char enc[512];
+    char url[1024];
 
     g_searching = true;
 
@@ -77,35 +77,15 @@ static int do_search(void)
                  "https://konachan.net/post.json?limit=%d&tags=%s",
                  MAX_POSTS, enc);
 
-    Result res = download(url, &buf, &size, &g_http);
-    g_res = (unsigned long)res;
-    g_size = (unsigned long)size;
-    if (res != 0) {
+    s_search_dl = dl_start(url);
+    if (!s_search_dl) {
+        g_searching = false;
         post_count = 0;
         cursor = 0;
-        snprintf(g_status, sizeof(g_status), "fail(%08lx) http:%lu %s",
-                 (unsigned long)res, (unsigned long)g_http, net_err());
-        g_searching = false;
+        snprintf(g_status, sizeof(g_status), "search failed");
         render_frame();
         return -1;
     }
-
-    parse_posts((char *)buf);
-    free(buf);
-
-    cursor = 0;
-    screen = SCR_LIST;
-    thumbs_reset();
-    bigview_reset();
-    save_reset();
-    bigview_request(cursor);
-    sdata_hist_push(current_tags);
-    g_searching = false;
-
-    if (post_count == 0)
-        snprintf(g_status, sizeof(g_status), "no results");
-    else
-        g_status[0] = 0;
     return 0;
 }
 
@@ -222,6 +202,11 @@ static void move_cursor(int delta)
     if (c < 0) c = 0;
     if (c > post_count - 1) c = post_count - 1;
     if (c != cursor) {
+        /* block page change until current page is fully loaded */
+        int old_page = cursor / PAGE_SIZE;
+        int new_page = c / PAGE_SIZE;
+        if (old_page != new_page && !thumbs_page_ready(cursor))
+            return;
         cursor = c;
         bigview_request(cursor);
     }
@@ -247,7 +232,7 @@ static void net_dns_init(void)
 /* BSD socket service for libcurl - 512KB is plenty for 2 concurrent
    16KB pumps and saves 512KB heap on OLD3DS (64MB total) */
 #define SOC_ALIGN 0x1000
-#define SOC_SIZE  0x80000
+#define SOC_SIZE  0x40000
 static u32 *s_soc = NULL;
 
 static bool net_soc_init(void)
@@ -269,8 +254,15 @@ int main(void)
     gfxInitDefault();
     romfsInit();
 
-    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
-    C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+    if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE)) {
+        gfxExit();
+        return 1;
+    }
+    if (!C2D_Init(C2D_DEFAULT_MAX_OBJECTS)) {
+        C3D_Fini();
+        gfxExit();
+        return 1;
+    }
     C2D_Prepare();
     s_top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
     s_bot = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
@@ -330,11 +322,14 @@ int main(void)
                 if ((kDown & KEY_DDOWN) && g_hist_sel < n - 1)
                     g_hist_sel++;
                 if (kDown & KEY_A) {
-                    strncpy(current_tags, sdata_hist_get(g_hist_sel),
-                            sizeof(current_tags) - 1);
-                    current_tags[sizeof(current_tags) - 1] = 0;
-                    g_hist_open = false;
-                    do_search();
+                    const char *h = sdata_hist_get(g_hist_sel);
+                    if (h) {
+                        strncpy(current_tags, h,
+                                sizeof(current_tags) - 1);
+                        current_tags[sizeof(current_tags) - 1] = 0;
+                        g_hist_open = false;
+                        do_search();
+                    }
                 }
             }
             if (kDown & (KEY_B | KEY_START))
@@ -351,11 +346,14 @@ int main(void)
                 if (tp.px >= 20 && tp.px <= 300 && row >= 0 && row < n &&
                     tp.py >= ry0 && tp.py < ry0 + n * 18.0f) {
                     g_hist_sel = row;
-                    strncpy(current_tags, sdata_hist_get(row),
-                            sizeof(current_tags) - 1);
-                    current_tags[sizeof(current_tags) - 1] = 0;
-                    g_hist_open = false;
-                    do_search();
+                    const char *h = sdata_hist_get(row);
+                    if (h) {
+                        strncpy(current_tags, h,
+                                sizeof(current_tags) - 1);
+                        current_tags[sizeof(current_tags) - 1] = 0;
+                        g_hist_open = false;
+                        do_search();
+                    }
                 } else if (!in_rect(tp.px, tp.py, 20, 30, 280, 190)) {
                     g_hist_open = false;
                 }
@@ -432,6 +430,67 @@ int main(void)
                     if (cspos.dy > 55) move_cursor(-GRID_COLS);
                     else if (cspos.dy < -55) move_cursor(GRID_COLS);
                 }
+            }
+        }
+
+        /* pump async search download */
+        if (s_search_dl) {
+            int r = dl_pump(s_search_dl);
+            if (r == DL_DONE) {
+                u8 *buf = (u8 *)dl_buf(s_search_dl);
+                u32 sz = dl_size(s_search_dl);
+                long code = dl_code(s_search_dl);
+                char err[128];
+                snprintf(err, sizeof(err), "%s", dl_err(s_search_dl));
+                dl_abort(s_search_dl);
+                s_search_dl = NULL;
+
+                g_http = (unsigned long)code;
+                g_size = (unsigned long)sz;
+                g_res = (unsigned long)code;
+
+                if (code != 200 || sz == 0) {
+                    post_count = 0;
+                    cursor = 0;
+                    snprintf(g_status, sizeof(g_status),
+                             "fail(%ld) http:%lu %s",
+                             code, (unsigned long)code, err);
+                    g_searching = false;
+                    render_frame();
+                } else {
+                    parse_posts((char *)buf);
+
+                    cursor = 0;
+                    screen = SCR_LIST;
+                    thumbs_reset();
+                    bigview_reset();
+                    save_reset();
+                    bigview_request(cursor);
+                    sdata_hist_push(current_tags);
+                    g_searching = false;
+
+                    if (post_count == 0)
+                        snprintf(g_status, sizeof(g_status),
+                                 "no results");
+                    else
+                        g_status[0] = 0;
+                }
+            } else if (r == DL_ERR) {
+                long code = dl_code(s_search_dl);
+                char err[128];
+                snprintf(err, sizeof(err), "%s", dl_err(s_search_dl));
+                g_http = (unsigned long)code;
+                g_size = (unsigned long)dl_size(s_search_dl);
+                g_res = (unsigned long)code;
+                dl_abort(s_search_dl);
+                s_search_dl = NULL;
+                post_count = 0;
+                cursor = 0;
+                snprintf(g_status, sizeof(g_status),
+                         "fail(%ld) http:%lu %s",
+                         code, (unsigned long)code, err);
+                g_searching = false;
+                render_frame();
             }
         }
 

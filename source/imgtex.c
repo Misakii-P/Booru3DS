@@ -35,7 +35,8 @@ static bool imgtex_common(C3D_Tex *tex, Tex3DS_SubTexture *sub,
 {
     u32 wp = next_pow2(w), hp = next_pow2(h);
 
-    /* static scratch: worst case 512x256 (400x240 big view), avoids heap churn */
+    /* static scratch: worst case 512x256 (400x240 big view + padding),
+       avoids heap churn and fragmentation on old3ds */
     static u8 s_pad[512 * 256 * 4];
     if (wp > 512 || hp > 256)
         return false;

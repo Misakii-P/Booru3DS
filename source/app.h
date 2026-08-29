@@ -37,7 +37,7 @@ typedef enum { SCR_HOME, SCR_LIST } Screen;
 extern int cursor;
 extern char current_tags[128];
 extern Screen screen;
-extern char g_status[128];
+extern char g_status[256];
 extern unsigned long g_res, g_http, g_size;
 extern const char *g_provider_name;
 extern int g_provider; /* index into provider list */

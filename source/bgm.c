@@ -128,7 +128,7 @@ void bgm_exit(void)
     bgm_stop();
     for (int i = 0; i < NUM_BUFFERS; i++) if (s_bufs[i]) { linearFree(s_bufs[i]); s_bufs[i] = NULL; }
     if (s_vorbis) { stb_vorbis_close(s_vorbis); s_vorbis = NULL; }
-    ndspExit();
+    if (s_ndsp_ok) ndspExit();
 }
 
 bool bgm_play(const char *path)

@@ -231,13 +231,15 @@ static size_t build_exif(unsigned char *b, const char *dt)
 static bool write_camera_jpeg(FILE *f, const unsigned char *jpg,
                               unsigned long sz)
 {
-    char dt[64] = "2026:01:01 00:00:00";
+    char dt[64];
     time_t t = time(NULL);
     struct tm *tmv = localtime(&t);
     if (tmv && tmv->tm_year >= 110)
         snprintf(dt, sizeof(dt), "%04d:%02d:%02d %02d:%02d:%02d",
                  tmv->tm_year + 1900, tmv->tm_mon + 1, tmv->tm_mday,
                  tmv->tm_hour, tmv->tm_min, tmv->tm_sec);
+    else
+        snprintf(dt, sizeof(dt), "2024:01:01 00:00:00");
 
     unsigned char exif[280];
     size_t exiflen = build_exif(exif, dt);
@@ -312,6 +314,8 @@ static bool camera_encode(u8 *jpg, u32 sz, const char *path)
         }
         dw = (W * num + den - 1) / den;
         dh = (H * num + den - 1) / den;
+        if (dw > CAM_MAX_W || dh > CAM_MAX_H)
+            return false;
         if (tjDecompress2(s_dec, jpg, sz, s_rgba, dw, 0, dh, TJPF_RGBA,
                           TJFLAG_FASTDCT))
             return false;
@@ -325,7 +329,7 @@ static bool camera_encode(u8 *jpg, u32 sz, const char *path)
             int pw = 0, ph = 0, pc = 0;
             if (!stbi_info_from_memory(jpg, (int)sz, &pw, &ph, &pc) ||
                 pw <= 0 || ph <= 0 ||
-                (long long)pw * ph > 10000000LL)
+                (long long)pw * ph > (long long)CAM_MAX_W * CAM_MAX_H)
                 return false;
         }
 
@@ -461,7 +465,11 @@ void save_pump(void)
     if (s.dest == SAVE_DEST_BOORU) {
         const u8 *buf = dl_buf(s.dl);
         if (total > 0 && s.fp) {
-            fwrite(buf, 1, total, s.fp);
+            if (fwrite(buf, 1, total, s.fp) != total) {
+                finish(false);
+                s.st = SAVE_ERR;
+                return;
+            }
             s.bytes += total;
             /* stream to SD so huge files never grow the heap */
             dl_consume(s.dl, total);
