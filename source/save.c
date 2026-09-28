@@ -47,10 +47,25 @@ static bool s_cam_notice = false;
 /* Why the last save failed. The UI showed a bare "save failed" for every
    distinct problem, which made them indistinguishable from the outside -
    a 4MB transfer abort and a full camera roll looked identical. */
+/* "saved!" / "save failed" are a 3s toast, not a sticky state - a message
+   that never goes away is just permanent noise once you have read it. */
+#define SAVE_MSG_MS 3000
+static u32 s_done_ms = 0;
+
+static u32 now_ms(void) { return (u32)(svcGetSystemTick() / 268123); }
+static void mark_done(void) { s_done_ms = now_ms(); }
+
 static char s_err[96] = "";
 static void set_err(const char *why) { snprintf(s_err, sizeof(s_err), "%s", why); }
 
 const char *save_error(void) { return s_err; }
+
+bool save_status_live(void)
+{
+    if (s.st != SAVE_OK && s.st != SAVE_ERR)
+        return false;
+    return (u32)(now_ms() - s_done_ms) < SAVE_MSG_MS;
+}
 
 bool save_take_cam_notice(void)
 {
@@ -406,8 +421,14 @@ static bool camera_encode(const char *path)
                 set_err("bad image header");
                 goto done;
             }
-            if ((long long)pw * ph > 64LL * 1024 * 1024) {
-                set_err("image too large to decode safely");
+            /* stb expands to W*H*4 before we can downscale, so this is
+               a hard RAM requirement, not a politeness limit. ~8MB is
+               about what old3DS can spare; anything larger fails as an
+               opaque "out of memory" from inside stb. */
+            if ((long long)pw * ph * 4 > 8LL * 1024 * 1024) {
+                snprintf(s_err, sizeof(s_err),
+                         "image too large to decode (%dx%d, needs %lldMB)",
+                         pw, ph, (long long)pw * ph * 4 / (1024 * 1024));
                 goto done;
             }
         }
@@ -415,7 +436,8 @@ static bool camera_encode(const char *path)
         fseek(rf, 0, SEEK_SET);
         u8 *src = stbi_load_from_file(rf, &W, &H, &comp, 4);
         if (!src) {
-            set_err("stb could not decode this image");
+            const char *why = stbi_failure_reason();
+            set_err(why ? why : "stb could not decode this image");
             goto done;
         }
         if (W <= 0 || H <= 0) {
@@ -498,17 +520,23 @@ done:
 
 /* ------------------------------------------------------------------ */
 
+static void resolve(const char *cand, char *out, int outsz)
+{
+    if (!strncmp(cand, "//", 2))
+        snprintf(out, outsz, "https:%s", cand);
+    else if (cand[0] == '/')
+        snprintf(out, outsz, "https://%s%s", net_host(), cand);
+    else
+        snprintf(out, outsz, "%s", cand);
+}
+
+/* The booru folder gets the untouched original - that is the whole point
+   of that target, and it streams to SD so size costs nothing. */
 static void build_url(int post, char *out, int outsz)
 {
     Post *p = &posts[post];
     if (p->file[0]) {
-        const char *cand = p->file;
-        if (!strncmp(cand, "//", 2))
-            snprintf(out, outsz, "https:%s", cand);
-        else if (cand[0] == '/')
-            snprintf(out, outsz, "https://%s%s", net_host(), cand);
-        else
-            snprintf(out, outsz, "%s", cand);
+        resolve(p->file, out, outsz);
         return;
     }
     if (p->image[0]) {
@@ -520,13 +548,33 @@ static void build_url(int post, char *out, int outsz)
     out[0] = 0;
 }
 
+/* The camera target is different: the output is capped at 640x480 because
+   that is all the 3DS camera indexes, so the original's extra resolution
+   is thrown away anyway - while costing us the download AND, fatally, the
+   decode. stb expands to W*H*4 before any downscale, and across a 420
+   post live sample the originals need a median 12MB and up to 193MB to
+   decode, which old3DS cannot do. The provider sample is at most ~850px
+   (safebooru) or 1500px (konachan): 6.8MB worst case, and visually
+   identical once it lands in a 640x480 JPEG. */
+static void build_camera_url(int post, char *out, int outsz)
+{
+    Post *p = &posts[post];
+    if (p->sample_ok && p->sample[0]) { resolve(p->sample, out, outsz); return; }
+    if (p->preview[0])                { resolve(p->preview, out, outsz); return; }
+    if (p->file[0])                   { resolve(p->file, out, outsz); return; }
+    out[0] = 0;
+}
+
 void save_request(int post, SaveDest dest)
 {
     if (s.st == SAVE_ACTIVE || post < 0 || post >= post_count)
         return;
 
     char url[512];
-    build_url(post, url, sizeof(url));
+    if (dest == SAVE_DEST_CAMERA)
+        build_camera_url(post, url, sizeof(url));
+    else
+        build_url(post, url, sizeof(url));
     if (!url[0]) {
         set_err("no download url for this post");
         s.st = SAVE_ERR;
@@ -595,6 +643,7 @@ void save_pump(void)
                 set_err("SD write failed");
                 finish(false);
                 s.st = SAVE_ERR;
+                mark_done();
                 return;
             }
             s.bytes += total;
@@ -605,10 +654,12 @@ void save_pump(void)
         if (r == DL_DONE) {
             finish(true);
             s.st = SAVE_OK;
+            mark_done();
         } else if (r == DL_ERR) {
             set_err(dl_err(s.dl));
             finish(false); /* remove partial file */
             s.st = SAVE_ERR;
+            mark_done();
         }
         return;
     }
@@ -626,6 +677,7 @@ void save_pump(void)
                 set_err("SD write failed");
                 finish(false);
                 s.st = SAVE_ERR;
+                mark_done();
                 return;
             }
             s.bytes += total;
@@ -647,11 +699,13 @@ void save_pump(void)
         if (!ok)
             remove(s.path); /* don't leave a broken photo in the roll */
         s.st = ok ? SAVE_OK : SAVE_ERR;
+        mark_done();
         if (ok)
             s_cam_notice = true;
     } else if (r == DL_ERR) {
         set_err(dl_err(s.dl));
         finish(false);
         s.st = SAVE_ERR;
+        mark_done();
     }
 }

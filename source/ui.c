@@ -463,12 +463,16 @@ static void render_bottom(void)
     if (sv == SAVE_ACTIVE)
         draw_text(SBAR_RX - 8, SBAR_TY + 10, 0.42f, COL_DIM, C2D_AlignRight,
                   "saving %lu KB", (unsigned long)(save_bytes() / 1024));
-    else if (sv == SAVE_OK)
-        draw_text(SBAR_RX - 8, SBAR_TY + 10, 0.42f, COL_ACCENT,
-                  C2D_AlignRight, "saved!");
-    else if (sv == SAVE_ERR)
-        draw_text(SBAR_RX - 8, SBAR_TY + 10, 0.42f, C2D_Color32(210, 70, 60, 255),
-                  C2D_AlignRight, "save failed: %.44s", save_error());
+    else if (save_status_live()) {
+        /* 3s toast, then back to the search bar */
+        if (sv == SAVE_OK)
+            draw_text(SBAR_RX - 8, SBAR_TY + 10, 0.42f, COL_ACCENT,
+                      C2D_AlignRight, "saved!");
+        else
+            draw_text(SBAR_RX - 8, SBAR_TY + 10, 0.42f,
+                      C2D_Color32(210, 70, 60, 255), C2D_AlignRight,
+                      "save failed: %.44s", save_error());
+    }
 
     /* thumbnail grid */
     int first_page = (cursor / PAGE_SIZE) * PAGE_SIZE;
