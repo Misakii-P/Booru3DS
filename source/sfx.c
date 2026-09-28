@@ -68,6 +68,16 @@ static bool parse_header(FILE *f, long *dataOff, u32 *dataBytes,
            *channels >= 1 && *channels <= 2;
 }
 
+/* per-channel mixer is the only volume control available (no
+   ndspChnSetVol in libctru); zeroing it is instant */
+static void apply_mix(int ch)
+{
+    float mix[12] = { 0 };
+    mix[0] = SFX_VOLUME;
+    mix[1] = SFX_VOLUME;
+    ndspChnSetMix(ch, mix);
+}
+
 static void load_voice(int i)
 {
     SfxVoice *v = &s_v[i];
@@ -110,10 +120,7 @@ static void load_voice(int i)
     ndspChnSetFormat(SFX_CH[i],
                      v->channels == 2 ? NDSP_FORMAT_STEREO_PCM16
                                       : NDSP_FORMAT_MONO_PCM16);
-    float mix[12] = { 0 };
-    mix[0] = SFX_VOLUME;
-    mix[1] = SFX_VOLUME;
-    ndspChnSetMix(SFX_CH[i], mix);
+    apply_mix(SFX_CH[i]);
 
     memset(&v->wb, 0, sizeof(v->wb));
     v->wb.data_vaddr = v->data;
@@ -147,6 +154,8 @@ static void play(int i)
     SfxVoice *v = &s_v[i];
     if (!v->ok)
         return;
+    /* also restores the mix if a suspend silenced the channel */
+    apply_mix(SFX_CH[i]);
     ndspChnWaveBufClear(SFX_CH[i]); /* restart cleanly on rapid triggers */
     v->wb.status = NDSP_WBUF_DONE;
     ndspChnWaveBufAdd(SFX_CH[i], &v->wb);
@@ -154,3 +163,30 @@ static void play(int i)
 
 void sfx_click(void) { play(0); }
 void sfx_alert(void) { play(1); }
+
+/* Same suspend/resume hazard as the BGM: the ndsp queue is dropped by the
+   console but our cached waveBuf is not, so a queued effect comes back
+   stale. play() re-adds on the next trigger, we just have to make sure
+   the cached buffer is clean and its status says "ready" again. */
+void sfx_suspend(void)
+{
+    float zero[12] = { 0 };
+    for (int i = 0; i < SFX_COUNT; i++) {
+        if (!s_v[i].ok) continue;
+        /* silence before dropping the queue, for the same reason as the BGM:
+           a half-played effect is still in our cache and would be audible */
+        ndspChnSetMix(SFX_CH[i], zero);
+        ndspChnWaveBufClear(SFX_CH[i]);
+    }
+}
+
+void sfx_resume(void)
+{
+    for (int i = 0; i < SFX_COUNT; i++) {
+        SfxVoice *v = &s_v[i];
+        if (!v->data) continue;
+        DSP_FlushDataCache(v->data, v->frames * v->channels * 2);
+        v->wb.status = NDSP_WBUF_DONE;
+    }
+    /* mix stays zeroed; play() restores it on the next trigger */
+}

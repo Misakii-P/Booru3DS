@@ -16,6 +16,27 @@ extern int stb_vorbis_seek_start(stb_vorbis *f);
 #define SAMPLESPERBUF  0x2000
 #define BGM_VOLUME     0.7f
 
+/* The per-channel mixer is the only volume control libctru exposes here
+   (there is no ndspChnSetVol), and it doubles as the suspend gate: zeroing
+   it is instant, whereas ndspChnWaveBufClear only takes effect once the DSP
+   has drained whatever is queued. */
+static void apply_bgm_mix(void)
+{
+    float mix[12] = {0};
+    mix[0] = BGM_VOLUME;
+    mix[1] = BGM_VOLUME;
+    ndspChnSetMix(0, mix);
+}
+
+static void silence_bgm(void)
+{
+    float zero[12] = {0};
+    ndspChnSetMix(0, zero);
+}
+
+/* true while we owe an unmute once bgm_update() has queued real audio */
+static bool s_muted = false;
+
 static FILE *s_file;
 static bool s_playing;
 static bool s_ndsp_ok;
@@ -182,9 +203,8 @@ bool bgm_play(const char *path)
     ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
     ndspChnSetRate(0, (float)s_sampleRate);
     ndspChnSetFormat(0, format);
-    float mix[12] = {0};
-    mix[0] = BGM_VOLUME; mix[1] = BGM_VOLUME;
-    ndspChnSetMix(0, mix);
+    apply_bgm_mix();
+    s_muted = false;
     s_totalRead = 0;
     memset(s_waveBufs, 0, sizeof(s_waveBufs));
     for (int i = 0; i < NUM_BUFFERS; i++) {
@@ -213,6 +233,38 @@ void bgm_set_on(bool on)
     }
 }
 
+/* The ndsp queue does not survive the console suspending us for the HOME
+   menu, but our own waveBuf.status fields do. After a restore the DSP has
+   forgotten the buffers while we still believe they are queued, so
+   bgm_update() skips them forever and the channel plays stale data - that
+   is the distortion on re-entry. So: drop the queue on the way down, and
+   on the way back flush the DSP cache and mark everything DONE to hand the
+   work back to bgm_update(). The refill itself stays on the main thread;
+   doing file I/O and a vorbis decode inside an APT callback would be no
+   safer than the bug. */
+void bgm_suspend(void)
+{
+    if (!s_ndsp_ok) return;
+    /* Silence first, drop the queue second. A buffer the DSP was part-way
+       through playing does not stop the instant the console suspends, and
+       it is still sitting in our cache marked as queued, so unmute-on-
+       resume alone would let that fragment be heard. */
+    silence_bgm();
+    ndspChnWaveBufClear(0);
+    s_muted = true;
+}
+
+void bgm_resume(void)
+{
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        if (s_bufs[i]) DSP_FlushDataCache(s_bufs[i], SAMPLESPERBUF * 4);
+        s_waveBufs[i].status = NDSP_WBUF_DONE;
+    }
+    /* deliberately still muted - bgm_update() un-mutes once it has queued
+       real audio, so the resume is inaudible until there is something to
+       hear */
+}
+
 bool bgm_on(void) { return s_on; }
 
 void bgm_update(void)
@@ -220,6 +272,7 @@ void bgm_update(void)
     if (!s_playing || !s_on) return;
     if (!s_is_ogg && !s_file) return;
     if (s_is_ogg && !s_vorbis) return;
+    bool queued = false;
     for (int i = 0; i < NUM_BUFFERS; i++) {
         if (s_waveBufs[i].status == NDSP_WBUF_DONE) {
             if (!s_is_ogg) {
@@ -229,6 +282,14 @@ void bgm_update(void)
             }
             fill_buffer(i);
             ndspChnWaveBufAdd(0, &s_waveBufs[i]);
+            queued = true;
         }
+    }
+
+    /* only now is there real audio behind the channel, so it is safe to be
+       audible again after a suspend */
+    if (queued && s_muted) {
+        apply_bgm_mix();
+        s_muted = false;
     }
 }

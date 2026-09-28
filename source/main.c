@@ -261,10 +261,37 @@ static bool net_soc_init(void)
 
 /* every init step is individually optional, so teardown has to be safe
    to run from a partially-built state - that is what the flags are for */
+/* The HOME menu suspends the app rather than killing it, so aptMainLoop()
+   keeps returning true and every static in the process survives - but the
+   ndsp queue does not. Without this hook the audio modules never learn
+   about it and playback comes back distorted after re-entry. */
+static void on_apt_hook(APT_HookType hook, void *param)
+{
+    (void)param;
+    switch (hook) {
+    case APTHOOK_ONSUSPEND:
+        bgm_suspend();
+        sfx_suspend();
+        break;
+    case APTHOOK_ONRESTORE:
+        bgm_resume();
+        sfx_resume();
+        break;
+    default:
+        break;
+    }
+}
+
+static aptHookCookie s_apt_cookie;
+
 static bool s_romfs_ok, s_c3d_ok, s_c2d_ok;
 
 static void teardown(void)
 {
+    /* stop the hook first: it must not fire into audio modules that are
+       about to be torn down */
+    aptUnhook(&s_apt_cookie);
+
     if (s_search_dl) {
         dl_abort(s_search_dl);
         s_search_dl = NULL;
@@ -335,6 +362,10 @@ int main(void)
     sfx_init();
     if (!bgm_play("romfs:/bgm.ogg"))
         snprintf(g_status, sizeof(g_status), "bgm not loaded");
+
+    /* after the audio modules exist, so the first suspend cannot race
+       their initialisation */
+    aptHook(&s_apt_cookie, on_apt_hook, NULL);
 
     sdata_load();
     g_provider = sdata_provider();

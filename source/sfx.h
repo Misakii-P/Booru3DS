@@ -7,3 +7,7 @@ void sfx_init(void);   /* after ndsp is up (bgm_init) */
 void sfx_exit(void);
 void sfx_click(void);
 void sfx_alert(void);
+
+/* APT suspend/resume, same reason as bgm_suspend/bgm_resume */
+void sfx_suspend(void);
+void sfx_resume(void);

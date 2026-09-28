@@ -1,0 +1,219 @@
+# ROM spec for `make cia` (consumed by the `cia` target in the Makefile).
+#
+# Structure, SystemCallAccess and the general shape come from the working
+# 3ds-game/cia.rsf, which is known to produce a CIA the 3DS accepts. Only the
+# identity fields, the old3DS memory settings and the service list differ.
+#
+# Things that matter for THIS app:
+#
+#   UniqueId      Only 20 bits of this end up in the title. makerom composes
+#                 the real 64-bit Program ID as
+#                     (type 0x0004 << 48) | (category 0x0000 << 32)
+#                   | (UniqueId << 8) | variation
+#                 giving Title ID 00040000<UniqueId>00. makerom masks the
+#                 value to 24 bits and then rejects anything with bits 20-31
+#                 set, so the usable range is 20 bits (1048576 ids). Picked at
+#                 random to avoid colliding with another homebrew build.
+#                 IT MUST NOT CHANGE - a different value is a different
+#                 title and the console installs a second copy instead of
+#                 updating the first.
+#
+#   RomFs         Booru3DS is not self-contained: bgm.ogg, click.wav and
+#                 alert.wav load from romfs:/ at runtime. A 3dsx gets its
+#                 romfs embedded by 3dsxtool; a CIA gets it from here, and
+#                 makerom builds the IVFC container from the directory.
+#                 Pointing this elsewhere yields a CIA that builds cleanly
+#                 and then dies on a missing file.
+#
+#   ServiceAccess Differs from 3ds-game deliberately. That one is an offline
+#   game and lists no networking at all. This app reaches the internet
+#                 through libcurl, so it needs the full set: ns:s for the
+#                 network setup, soc:U + socket:u for BSD sockets, ssl:u
+#                 for mbedTLS, http:C, dlp:SRVR, mcu::HWC for the AES
+#                 hardware, and ptm:u for the clock (the camera EXIF dates
+#                 come from time()). Dropping any of them means the app
+#                 hangs or faults on the first request.
+#
+#   CpuSpeed      268MHz and no L2 on purpose. The code is explicitly
+#   EnableL2Cache old3DS-hardened (~206KB BSS, SOC buffer sized down), and
+#   SystemModeExt asking for 804MHz here would make the title refuse to
+#                 launch on the hardware it was written for.
+#
+#   SaveDataSize  0KB, not 0 - makerom rejects a bare 0.
+#   EnableCompress false keeps the exefs uncompressed so the CIA also
+#                 installs on firmware older than 11.0.
+
+BasicInfo:
+  Title                   : "Booru3DS"
+  CompanyCode             : "BO"
+  ProductCode             : CTR-P-BOOR
+  Logo                    : Homebrew
+TitleInfo:
+  Category                : Application
+  UniqueId                : 0xE2B97
+RomFs:
+  RootPath                : romfs
+Option:
+  UseOnSD                 : true
+  FreeProductCode         : true
+  MediaFootPadding        : false
+  EnableCrypt             : false
+  EnableCompress          : false
+AccessControlInfo:
+  CoreVersion                   : 2
+  DescVersion                   : 2
+  ReleaseKernelMajor            : "02"
+  ReleaseKernelMinor            : "44"
+  MemoryType                    : Application
+  SystemMode                    : 64MB
+  IdealProcessor                : 0
+  AffinityMask                  : 1
+  Priority                      : 16
+  MaxCpu                        : 0x9E
+  HandleTableSize               : 0x200
+  DisableDebug                  : false
+  EnableForceDebug              : false
+  CanWriteSharedPage            : true
+  CanUsePrivilegedPriority      : false
+  CanUseNonAlphabetAndNumber    : true
+  PermitMainFunctionArgument    : true
+  CanShareDeviceMemory          : true
+  RunnableOnSleep               : false
+  SpecialMemoryArrange          : true
+  SystemModeExt                 : Legacy
+  CpuSpeed                      : 268MHz
+  EnableL2Cache                 : false
+  CanAccessCore2                : true
+  IORegisterMapping:
+   - 1ff50000-1ff57fff
+   - 1ff70000-1ff77fff
+  MemoryMapping:
+   - 1f000000-1f5fffff:r
+  FileSystemAccess:
+   - Debug
+   - DirectSdmc
+   - DirectSdmcWrite
+  ServiceAccessControl:
+   - APT:U
+   - $hioFIO
+   - $hostio0
+   - $hostio1
+   - ac:u
+   - am:u
+   - boss:U
+   - cam:u
+   - cfg:u
+   - csnd:SND
+   - dlp:SRVR
+   - dsp::DSP
+   - fs:USER
+   - gsp::Gpu
+   - gsp::Lcd
+   - hid:USER
+   - http:C
+   - ir:USER
+   - ir:u
+   - ldr:ro
+   - mcu::HWC
+   - ndm:u
+   - news:s
+   - ns:s
+   - nwm::UDS
+   - ptm:u
+   - pxi:dev
+   - socket:u
+   - soc:U
+   - ssl:u
+   - y2r:u
+  InterruptNumbers:
+  SystemCallAccess:
+    ControlMemory: 1
+    QueryMemory: 2
+    ExitProcess: 3
+    GetProcessAffinityMask: 4
+    SetProcessAffinityMask: 5
+    GetProcessIdealProcessor: 6
+    SetProcessIdealProcessor: 7
+    CreateThread: 8
+    ExitThread: 9
+    SleepThread: 10
+    GetThreadPriority: 11
+    SetThreadPriority: 12
+    GetThreadAffinityMask: 13
+    SetThreadAffinityMask: 14
+    GetThreadIdealProcessor: 15
+    SetThreadIdealProcessor: 16
+    GetCurrentProcessorNumber: 17
+    Run: 18
+    CreateMutex: 19
+    ReleaseMutex: 20
+    CreateSemaphore: 21
+    ReleaseSemaphore: 22
+    CreateEvent: 23
+    SignalEvent: 24
+    ClearEvent: 25
+    CreateTimer: 26
+    SetTimer: 27
+    CancelTimer: 28
+    ClearTimer: 29
+    CreateMemoryBlock: 30
+    MapMemoryBlock: 31
+    CreateAddressArbiter: 33
+    ArbitrateAddress: 34
+    CloseHandle: 35
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+    SignalAndWait: 38
+    DuplicateHandle: 39
+    GetSystemTick: 40
+    GetHandleInfo: 41
+    GetSystemInfo: 42
+    GetProcessInfo: 43
+    GetThreadInfo: 44
+    ConnectToPort: 45
+    SendSyncRequest1: 46
+    SendSyncRequest2: 47
+    SendSyncRequest3: 48
+    SendSyncRequest: 49
+    OpenProcess: 51
+    OpenThread: 52
+    GetProcessId: 53
+    GetProcessIdOfThread: 54
+    GetThreadId: 55
+    GetResourceLimit: 56
+    GetResourceLimitLimitValues: 57
+    GetResourceLimitCurrentValues: 58
+    GetThreadContext: 59
+    Break: 60
+    OutputDebugString: 61
+  InterruptNumbers:
+SystemControlInfo:
+  SaveDataSize: 0KB
+  RemasterVersion: 0
+  StackSize: 0x40000
+  Dependency:
+    ac: 0x0004013000002402L
+    am: 0x0004013000001502L
+    boss: 0x0004013000003402L
+    cfg: 0x0004013000001702L
+    codec: 0x0004013000001802L
+    csnd: 0x0004013000002702L
+    dlp: 0x0004013000002802L
+    dsp: 0x0004013000001a02L
+    gpio: 0x0004013000001b02L
+    gsp: 0x0004013000001c02L
+    hid: 0x0004013000001d02L
+    http: 0x0004013000002902L
+    i2c: 0x0004013000001e02L
+    mcu: 0x0004013000001f02L
+    ndm: 0x0004013000002b02L
+    news: 0x0004013000003502L
+    nwm: 0x0004013000002d02L
+    pdn: 0x0004013000002102L
+    ps: 0x0004013000003102L
+    ptm: 0x0004013000002202L
+    ro: 0x0004013000003702L
+    socket: 0x0004013000002e02L
+    spi: 0x0004013000002302L
+    ssl: 0x0004013000002f02L
+    ns: 0x0004013000002b02L
