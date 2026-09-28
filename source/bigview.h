@@ -4,6 +4,8 @@
 #include <tex3ds.h>
 
 /* big top-screen image: fetches sample/file url for the cursor post */
+void bigview_init(void);
+void bigview_exit(void);
 void bigview_reset(void);
 void bigview_abort(void);
 void bigview_request(int post);

@@ -3,7 +3,10 @@
 #define SDATA_HIST_MAX 8
 
 void sdata_load(void);
-void sdata_save(void);
+/* Setters only mark the file dirty; sdata_pump() - called once per frame -
+   does the actual SD write so the input handler never stalls on I/O. */
+void sdata_pump(void);
+void sdata_exit(void); /* flush pending changes */
 
 int sdata_provider(void);
 void sdata_set_provider(int pv);

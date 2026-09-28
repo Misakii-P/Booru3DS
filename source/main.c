@@ -27,15 +27,12 @@ char current_tags[128] = "";
 Screen screen = SCR_HOME;
 
 char g_status[256] = "";
-unsigned long g_res = 0, g_http = 0, g_size = 0;
 
 /* API providers: safebooru (gelbooru dapi) works from emulators with a PC
    network stack, but its CDN 403-blocks real 3DS TLS. konachan.net serves
-   the same style of content and accepts the 3DS's requests. */
-static const char *const PV_NAMES[] = { "safebooru.org", "konachan.net" };
-#define PV_COUNT 2
-static int pv = 0;
-const char *g_provider_name = PV_NAMES[0];
+   the same style of content and accepts the 3DS's requests. The table
+   (names + hosts) lives in net.c so every URL builder resolves relative
+   paths against the site that is actually selected. */
 int g_provider = 0;
 bool g_save_prompt = false;
 bool g_about_open = false;
@@ -68,7 +65,7 @@ static int do_search(void)
     render_frame();
 
     url_encode(current_tags, enc, sizeof(enc));
-    if (pv == 0)
+    if (g_provider == 0)
         snprintf(url, sizeof(url),
                  "https://safebooru.org/index.php?page=dapi&s=post&q=index"
                  "&json=1&limit=%d&tags=%s", MAX_POSTS, enc);
@@ -77,7 +74,9 @@ static int do_search(void)
                  "https://konachan.net/post.json?limit=%d&tags=%s",
                  MAX_POSTS, enc);
 
-    s_search_dl = dl_start(url);
+    /* the search response is JSON, so it is the one transfer worth
+       asking for compressed */
+    s_search_dl = dl_start(url, true);
     if (!s_search_dl) {
         g_searching = false;
         post_count = 0;
@@ -192,24 +191,31 @@ static void move_cursor(int delta)
 {
     if (post_count <= 0)
         return;
-    /* coalesce rapid DPad repeats */
-    static u32 lastMove = 0;
-    u32 now = svcGetSystemTick() / 268123;
-    if (now - lastMove < 80 && delta != 0) return;
-    lastMove = now;
 
     int c = cursor + delta;
     if (c < 0) c = 0;
     if (c > post_count - 1) c = post_count - 1;
     if (c != cursor) {
-        /* block page change until current page is fully loaded */
-        int old_page = cursor / PAGE_SIZE;
-        int new_page = c / PAGE_SIZE;
-        if (old_page != new_page && !thumbs_page_ready(cursor))
-            return;
+        /* Move immediately. Waiting for all twelve thumbnails of the page
+           we are leaving made paging feel broken, and it bought nothing:
+           the LRU cache already keeps them, so coming back is instant,
+           and thumbs that are still in flight simply keep filling in. */
         cursor = c;
         bigview_request(cursor);
     }
+}
+
+/* The Circle Pad and C-Stick report every frame, so they need their own
+   repeat throttle; the D-Pad is already edge-triggered via hidKeysDown()
+   and throttling it would swallow legitimate presses. */
+static u32 s_lastMove = 0;
+
+static void move_cursor_analog(int delta)
+{
+    u32 now = svcGetSystemTick() / 268123;
+    if (now - s_lastMove < 80) return;
+    s_lastMove = now;
+    move_cursor(delta);
 }
 
 /* libcurl resolves DNS via newlib's resolver, which needs /etc/resolv.conf
@@ -229,11 +235,14 @@ static void net_dns_init(void)
     fclose(f);
 }
 
-/* BSD socket service for libcurl - 512KB is plenty for 2 concurrent
-   16KB pumps and saves 512KB heap on OLD3DS (64MB total) */
+/* BSD socket service for libcurl - 256KB covers the per-connection socket
+   structs for every transfer that can be in flight at once (2 thumbnails
+   plus the big view or a save), and saves 256KB of heap on OLD3DS
+   (64MB total) */
 #define SOC_ALIGN 0x1000
 #define SOC_SIZE  0x40000
 static u32 *s_soc = NULL;
+static bool s_soc_ready = false;
 
 static bool net_soc_init(void)
 {
@@ -246,29 +255,77 @@ static bool net_soc_init(void)
         s_soc = NULL;
         return false;
     }
+    s_soc_ready = true;
     return true;
+}
+
+/* every init step is individually optional, so teardown has to be safe
+   to run from a partially-built state - that is what the flags are for */
+static bool s_romfs_ok, s_c3d_ok, s_c2d_ok;
+
+static void teardown(void)
+{
+    if (s_search_dl) {
+        dl_abort(s_search_dl);
+        s_search_dl = NULL;
+    }
+    thumbs_exit();
+    bigview_exit();
+    save_exit();
+    sfx_exit();
+    bgm_exit();
+    sdata_exit();
+    ui_exit();
+    if (s_c2d_ok) {
+        C2D_Fini();
+        s_c2d_ok = false;
+    }
+    if (s_c3d_ok) {
+        C3D_Fini();
+        s_c3d_ok = false;
+    }
+    if (s_romfs_ok) {
+        romfsExit();
+        s_romfs_ok = false;
+    }
+    net_exit(); /* after every dl_t has been aborted */
+    if (s_soc_ready) {
+        socExit();
+        s_soc_ready = false;
+    }
+    free(s_soc);
+    s_soc = NULL;
+    gfxExit();
 }
 
 int main(void)
 {
     gfxInitDefault();
-    romfsInit();
 
-    if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE)) {
+    if (R_FAILED(romfsInit())) {
         gfxExit();
         return 1;
     }
-    if (!C2D_Init(C2D_DEFAULT_MAX_OBJECTS)) {
-        C3D_Fini();
-        gfxExit();
-        return 1;
-    }
+    s_romfs_ok = true;
+
+    if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE))
+        goto fail;
+    s_c3d_ok = true;
+
+    if (!C2D_Init(C2D_DEFAULT_MAX_OBJECTS))
+        goto fail;
+    s_c2d_ok = true;
     C2D_Prepare();
+
     s_top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
     s_bot = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+    if (!s_top || !s_bot)
+        goto fail;
+    if (!ui_init(&s_top, &s_bot))
+        goto fail;
 
-    ui_init(&s_top, &s_bot);
     thumbs_init();
+    bigview_init();
     save_init();
     net_dns_init();
     if (!net_soc_init())
@@ -280,11 +337,9 @@ int main(void)
         snprintf(g_status, sizeof(g_status), "bgm not loaded");
 
     sdata_load();
-    pv = sdata_provider();
-    if (pv < 0 || pv >= PV_COUNT)
-        pv = 0;
-    g_provider = pv;
-    g_provider_name = PV_NAMES[pv];
+    g_provider = sdata_provider();
+    if (g_provider < 0 || g_provider >= PV_COUNT)
+        g_provider = 0;
 
     render_frame();
 
@@ -368,7 +423,9 @@ int main(void)
             if (kDown & KEY_X)
                 prompt_search();
 
-            if ((kDown & KEY_Y) && sdata_hist_count() > 0) {
+            /* like the other modals, history stays shut during a search:
+               picking an entry while one is in flight is a silent no-op */
+            if ((kDown & KEY_Y) && !g_searching && sdata_hist_count() > 0) {
                 g_hist_sel = 0;
                 g_hist_open = true;
             }
@@ -377,16 +434,15 @@ int main(void)
                 go_home();
 
             if (kDown & KEY_SELECT) {
-                pv = (pv + 1) % PV_COUNT;
-                g_provider = pv;
-                g_provider_name = PV_NAMES[pv];
-                sdata_set_provider(pv);
+                g_provider = (g_provider + 1) % PV_COUNT;
+                sdata_set_provider(g_provider);
                 current_tags[0] = 0;
                 screen = SCR_HOME;
                 thumbs_reset();
                 bigview_reset();
                 save_reset();
-                snprintf(g_status, sizeof(g_status), "site: %s", PV_NAMES[pv]);
+                snprintf(g_status, sizeof(g_status), "site: %s",
+                         provider_name());
             }
 
             if (kDown & KEY_TOUCH) {
@@ -413,22 +469,22 @@ int main(void)
             hidCircleRead(&cpos);
             if (abs(cpos.dx) > 55 || abs(cpos.dy) > 55) {
                 if (abs(cpos.dx) > abs(cpos.dy)) {
-                    if (cpos.dx > 55) move_cursor(1);
-                    else if (cpos.dx < -55) move_cursor(-1);
+                    if (cpos.dx > 55) move_cursor_analog(1);
+                    else if (cpos.dx < -55) move_cursor_analog(-1);
                 } else {
-                    if (cpos.dy > 55) move_cursor(-GRID_COLS);
-                    else if (cpos.dy < -55) move_cursor(GRID_COLS);
+                    if (cpos.dy > 55) move_cursor_analog(-GRID_COLS);
+                    else if (cpos.dy < -55) move_cursor_analog(GRID_COLS);
                 }
             }
             circlePosition cspos;
             hidCstickRead(&cspos);
             if (abs(cspos.dx) > 55 || abs(cspos.dy) > 55) {
                 if (abs(cspos.dx) > abs(cspos.dy)) {
-                    if (cspos.dx > 55) move_cursor(1);
-                    else if (cspos.dx < -55) move_cursor(-1);
+                    if (cspos.dx > 55) move_cursor_analog(1);
+                    else if (cspos.dx < -55) move_cursor_analog(-1);
                 } else {
-                    if (cspos.dy > 55) move_cursor(-GRID_COLS);
-                    else if (cspos.dy < -55) move_cursor(GRID_COLS);
+                    if (cspos.dy > 55) move_cursor_analog(-GRID_COLS);
+                    else if (cspos.dy < -55) move_cursor_analog(GRID_COLS);
                 }
             }
         }
@@ -445,16 +501,12 @@ int main(void)
                 dl_abort(s_search_dl);
                 s_search_dl = NULL;
 
-                g_http = (unsigned long)code;
-                g_size = (unsigned long)sz;
-                g_res = (unsigned long)code;
-
                 if (code != 200 || sz == 0) {
                     post_count = 0;
                     cursor = 0;
                     snprintf(g_status, sizeof(g_status),
-                             "fail(%ld) http:%lu %s",
-                             code, (unsigned long)code, err);
+                             "fail(%ld) http:%ld %s",
+                             code, code, err);
                     g_searching = false;
                     render_frame();
                 } else {
@@ -479,16 +531,13 @@ int main(void)
                 long code = dl_code(s_search_dl);
                 char err[128];
                 snprintf(err, sizeof(err), "%s", dl_err(s_search_dl));
-                g_http = (unsigned long)code;
-                g_size = (unsigned long)dl_size(s_search_dl);
-                g_res = (unsigned long)code;
                 dl_abort(s_search_dl);
                 s_search_dl = NULL;
                 post_count = 0;
                 cursor = 0;
                 snprintf(g_status, sizeof(g_status),
-                         "fail(%ld) http:%lu %s",
-                         code, (unsigned long)code, err);
+                         "fail(%ld) http:%ld %s",
+                         code, code, err);
                 g_searching = false;
                 render_frame();
             }
@@ -502,23 +551,16 @@ int main(void)
             g_camwarn_open = true;
             sfx_alert();
         }
+        sdata_pump(); /* flush settings off the input/critical path */
         bgm_update();
         render_frame();
         gspWaitForVBlank();
     }
 
-    thumbs_reset();
-    thumbs_exit();
-    bigview_reset();
-    save_exit();
-    sfx_exit();
-    ui_exit();
-    C2D_Fini();
-    C3D_Fini();
-    bgm_exit();
-    romfsExit();
-    socExit();
-    free(s_soc);
-    gfxExit();
+    teardown();
     return 0;
+
+fail:
+    teardown();
+    return 1;
 }

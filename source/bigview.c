@@ -8,34 +8,60 @@
 #include <turbojpeg.h>
 
 #include "net.h"
-#include <curl/curl.h>
 #include "posts.h"
 #include "imgtex.h"
 #include "bigview.h"
 
 #define BIG_MAX_W 400
 #define BIG_MAX_H 240
+#define BIG_RETRY_FRAMES 300 /* ~5s at 60fps */
 
 static struct
 {
-    int post;      /* currently loaded */
-    int want;      /* requested */
+    int post;      /* currently loaded, and which post it belongs to */
+    int want;      /* what the cursor is asking for */
+    int fetching;  /* post the in-flight transfer is actually for; want
+                      can move underneath it when a request is coalesced */
     bool ready;
     bool failed;
+    u32 retry_at;  /* frame stamp; failures are retried, not sticky */
     dl_t *dl;
     C3D_Tex tex;
     Tex3DS_SubTexture sub;
-} s_big = { -1, -1, false, false, NULL, {}, {} };
+} s_big = { -1, -1, -1, false, false, 0, NULL, {}, {} };
+
+static u32 s_frame = 1;
+static tjhandle s_tj;
+static char s_err[192] = "";
+const char *g_big_err = s_err;
+
+void bigview_init(void)
+{
+    s_tj = tjInitDecompress();
+}
+
+void bigview_exit(void)
+{
+    bigview_reset();
+    if (s_tj) {
+        tjDestroy(s_tj);
+        s_tj = NULL;
+    }
+}
 
 void bigview_reset(void)
 {
-    if (s_big.dl)
+    if (s_big.dl) {
         dl_abort(s_big.dl);
-    if (s_big.ready || s_big.failed)
+        s_big.dl = NULL;
+    }
+    if (s_big.ready)
         C3D_TexDelete(&s_big.tex);
     memset(&s_big, 0, sizeof(s_big));
     s_big.post = -1;
     s_big.want = -1;
+    s_big.fetching = -1;
+    s_err[0] = 0;
 }
 
 void bigview_abort(void)
@@ -87,7 +113,7 @@ static void build_url(int post, char *out, int outsz)
     if (!strncmp(cand, "//", 2))
         snprintf(out, outsz, "https:%s", cand);
     else if (cand[0] == '/')
-        snprintf(out, outsz, "https://safebooru.org%s", cand);
+        snprintf(out, outsz, "https://%s%s", net_host(), cand);
     else
         snprintf(out, outsz, "%s", cand);
 }
@@ -95,39 +121,47 @@ static void build_url(int post, char *out, int outsz)
 /* largest supported downscale fitting the top screen budget */
 static bool decode_big(u8 *jpg, u32 sz, C3D_Tex *tex, Tex3DS_SubTexture *sub)
 {
-    static tjhandle s_tj = NULL;
-    if (!s_tj)
-        s_tj = tjInitDecompress();
     if (!s_tj)
         return false;
 
-    /* decoded big view never exceeds 400x240 (static scratch) */
-    static u8 s_rgba[BIG_MAX_W * BIG_MAX_H * 4];
-
-    bool ok = false;
     int W = 0, H = 0;
-    if (tjDecompressHeader(s_tj, jpg, sz, &W, &H) == 0 && W > 0 && H > 0) {
-        int num = 1, den = 1, nsf = 0;
-        tjscalingfactor *sf = tjGetScalingFactors(&nsf);
-        for (int i = 0; sf && i < nsf; i++) {
-            if (sf[i].num > sf[i].denom)
-                continue;
-            int dw = (W * sf[i].num + sf[i].denom - 1) / sf[i].denom;
-            int dh = (H * sf[i].num + sf[i].denom - 1) / sf[i].denom;
-            if (dw <= BIG_MAX_W && dh <= BIG_MAX_H) {
-                num = sf[i].num;
-                den = sf[i].denom;
-                break;
-            }
+    if (tjDecompressHeader(s_tj, jpg, sz, &W, &H) != 0 || W <= 0 || H <= 0)
+        return false;
+
+    int num = 1, den = 1, nsf = 0;
+    tjscalingfactor *sf = tjGetScalingFactors(&nsf);
+    for (int i = 0; sf && i < nsf; i++) {
+        if (sf[i].num > sf[i].denom)
+            continue;
+        int dw = (W * sf[i].num + sf[i].denom - 1) / sf[i].denom;
+        int dh = (H * sf[i].num + sf[i].denom - 1) / sf[i].denom;
+        if (dw <= BIG_MAX_W && dh <= BIG_MAX_H) {
+            num = sf[i].num;
+            den = sf[i].denom;
+            break;
         }
-        int dw = (W * num + den - 1) / den;
-        int dh = (H * num + den - 1) / den;
-
-        if (tjDecompress2(s_tj, jpg, sz, s_rgba, dw, 0, dh, TJPF_RGBA,
-                          TJFLAG_FASTDCT) == 0)
-            ok = imgtex_make(tex, sub, s_rgba, dw, dh);
     }
+    int dw = (W * num + den - 1) / den;
+    int dh = (H * num + den - 1) / den;
 
+    /* When no scale factor fits - anything taller than 1920 or wider than
+       3200, which is most full-size originals - num/den are still 1/1 and
+       dw/dh are the full image. Decoding that into a screen-sized buffer
+       overruns it by orders of magnitude, so refuse instead. */
+    if (dw > BIG_MAX_W || dh > BIG_MAX_H)
+        return false;
+
+    /* sized to the actual decode rather than the worst case, and freed
+       straight after: a fixed 384KB scratch in BSS is worth having back
+       on the heap the rest of the time */
+    u8 *rgba = (u8 *)malloc((size_t)dw * dh * 4);
+    if (!rgba)
+        return false;
+
+    bool ok = tjDecompress2(s_tj, jpg, sz, rgba, dw, 0, dh, TJPF_RGBA,
+                            TJFLAG_FASTDCT) == 0 &&
+             imgtex_make(tex, sub, rgba, dw, dh);
+    free(rgba);
     return ok;
 }
 
@@ -141,8 +175,6 @@ bool bigview_failed(void)
     return s_big.failed;
 }
 
-const char *g_big_err = "";
-
 u32 bigview_bytes(void)
 {
     return s_big.dl ? dl_size(s_big.dl) : 0;
@@ -150,51 +182,76 @@ u32 bigview_bytes(void)
 
 void bigview_pump(void)
 {
+    s_frame++;
+
     if (post_count <= 0 || s_big.want < 0 || s_big.want >= post_count)
         return;
 
-    /* start fetch when idle and the wanted post differs from loaded */
-    if (!s_big.dl && !s_big.ready && !s_big.failed &&
-        s_big.want != s_big.post) {
+    /* a failure is not permanent: give it a few seconds and try again,
+       the same way thumbnails do */
+    if (s_big.failed && s_big.want != s_big.post &&
+        s_frame - s_big.retry_at >= BIG_RETRY_FRAMES) {
+        s_big.failed = false;
+        s_err[0] = 0;
+    }
+
+    /* Start a fetch whenever what we hold is not what the cursor wants.
+       That includes the case where a finished transfer is now stale
+       because a request was coalesced onto it - otherwise the texture
+       for the old post would sit there and block its own replacement. */
+    if (!s_big.dl && !s_big.failed && s_big.want != s_big.post) {
+        if (s_big.ready) {
+            C3D_TexDelete(&s_big.tex);
+            s_big.ready = false;
+        }
         char url[512];
         build_url(s_big.want, url, sizeof(url));
         if (!url[0]) {
             s_big.failed = true;
+            s_big.retry_at = s_frame;
             return;
         }
-        s_big.dl = dl_start(url);
-        if (!s_big.dl)
+        s_big.dl = dl_start(url, false);
+        if (!s_big.dl) {
             s_big.failed = true;
+            s_big.retry_at = s_frame;
+        } else {
+            s_big.fetching = s_big.want;
+        }
         return;
     }
 
     if (s_big.dl) {
         int r = dl_pump(s_big.dl);
         if (r == DL_DONE) {
-            long code = 0;
-            code = dl_code(s_big.dl);
+            long code = dl_code(s_big.dl);
             u8 *buf = (u8 *)dl_buf(s_big.dl);
             u32 sz = dl_size(s_big.dl);
             bool ok = sz >= 16 &&
                       decode_big(buf, sz, &s_big.tex, &s_big.sub);
-            static char errbuf[192];
-            if (!ok)
-                snprintf(errbuf, sizeof(errbuf), "%s (http %ld%s)",
+            if (ok) {
+                s_err[0] = 0;
+            } else {
+                snprintf(s_err, sizeof(s_err), "%s (http %ld%s)",
                          dl_err(s_big.dl), code,
-                         sz < 16 ? ", empty" : "");
-            g_big_err = errbuf;
+                         sz < 16 ? ", empty" : "too large");
+            }
             dl_abort(s_big.dl);
             s_big.dl = NULL;
-            s_big.post = ok ? s_big.want : -1;
+            /* credit the texture to the post this transfer was started
+               for, not to want: a request that arrived mid-flight moved
+               want on, and attributing these bytes to it would paint the
+               previous post's image under the new cursor */
+            s_big.post = ok ? s_big.fetching : -1;
             s_big.ready = ok;
             s_big.failed = !ok;
+            s_big.retry_at = s_frame;
         } else if (r == DL_ERR) {
-            static char errbuf[192];
-            snprintf(errbuf, sizeof(errbuf), "%s", dl_err(s_big.dl));
-            g_big_err = errbuf;
+            snprintf(s_err, sizeof(s_err), "%s", dl_err(s_big.dl));
             dl_abort(s_big.dl);
             s_big.dl = NULL;
             s_big.failed = true;
+            s_big.retry_at = s_frame;
         }
     }
 }

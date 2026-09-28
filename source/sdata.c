@@ -16,6 +16,8 @@ static struct
     char hist[SDATA_HIST_MAX][SDATA_TAGS];
 } s;
 
+static bool s_dirty;
+
 void sdata_load(void)
 {
     memset(&s, 0, sizeof(s));
@@ -27,11 +29,14 @@ void sdata_load(void)
     char line[SDATA_TAGS + 16];
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = 0;
-        if (!strncmp(line, "provider=", 9))
+        if (!strncmp(line, "provider=", 9)) {
             s.provider = atoi(line + 9);
-        else if (!strncmp(line, "camwarn=", 8))
+        } else if (!strncmp(line, "camwarn=", 8)) {
             s.camwarn = atoi(line + 8) != 0;
-        else if (!strncmp(line, "hist=", 5) && s.hist_n < SDATA_HIST_MAX) {
+        } else if (!strncmp(line, "hist=", 5) && s.hist_n < SDATA_HIST_MAX) {
+            /* skip blank entries: an empty row is not a search */
+            if (!line[5])
+                continue;
             size_t vl = strlen(line + 5);
             if (vl > SDATA_TAGS - 1)
                 vl = SDATA_TAGS - 1;
@@ -47,19 +52,28 @@ void sdata_load(void)
         s.provider = 0;
 }
 
-void sdata_save(void)
+void sdata_pump(void)
 {
+    if (!s_dirty)
+        return;
+    s_dirty = false;
+
     mkdir("sdmc:/3ds", 0777);
     mkdir("sdmc:/3ds/booru", 0777);
 
     FILE *f = fopen(SDATA_PATH, "w");
     if (!f)
-        return;
+        return; /* no SD: settings are best-effort, do not spin on it */
     fprintf(f, "provider=%d\n", s.provider);
     fprintf(f, "camwarn=%d\n", s.camwarn ? 1 : 0);
     for (int i = 0; i < s.hist_n; i++)
         fprintf(f, "hist=%s\n", s.hist[i]);
     fclose(f);
+}
+
+void sdata_exit(void)
+{
+    sdata_pump();
 }
 
 bool sdata_cam_warn(void)
@@ -72,7 +86,7 @@ void sdata_set_cam_warn(void)
     if (s.camwarn)
         return;
     s.camwarn = true;
-    sdata_save();
+    s_dirty = true;
 }
 
 int sdata_provider(void)
@@ -85,7 +99,7 @@ void sdata_set_provider(int pv)
     if (pv == s.provider)
         return;
     s.provider = pv;
-    sdata_save();
+    s_dirty = true;
 }
 
 int sdata_hist_count(void)
@@ -115,14 +129,15 @@ void sdata_hist_push(const char *tags)
     }
     if (found >= 0) {
         for (int i = found; i > 0; i--)
-            strncpy(s.hist[i], s.hist[i - 1], SDATA_TAGS);
+            memcpy(s.hist[i], s.hist[i - 1], sizeof(s.hist[0]));
+        memset(s.hist[0], 0, sizeof(s.hist[0]));
         strncpy(s.hist[0], tags, SDATA_TAGS - 1);
         s.hist[0][SDATA_TAGS - 1] = 0;
-        sdata_save();
+        s_dirty = true;
         return;
     }
 
-    /* shift down, cap at 10 */
+    /* shift down, cap at SDATA_HIST_MAX */
     if (s.hist_n < SDATA_HIST_MAX)
         s.hist_n++;
     for (int i = s.hist_n - 1; i > 0; i--)
@@ -130,5 +145,5 @@ void sdata_hist_push(const char *tags)
     memset(s.hist[0], 0, sizeof(s.hist[0]));
     strncpy(s.hist[0], tags, SDATA_TAGS - 1);
 
-    sdata_save();
+    s_dirty = true;
 }

@@ -6,6 +6,7 @@
 #include <3ds.h>
 #include <curl/curl.h>
 
+#include "app.h"
 #include "net.h"
 
 /* real-hardware 3DS: the system SSL module's TLS handshake gets 403'd by
@@ -17,6 +18,29 @@
 /* hard cap per buffered transfer (save streams via dl_consume, so it never
    comes close); full-size file_url images are written to SD incrementally */
 #define DL_MAX_BUF (4 * 1024 * 1024)
+
+const Provider g_providers[PV_COUNT] = {
+    { "safebooru.org", "safebooru.org" },
+    { "konachan.net",  "konachan.net"  },
+};
+
+static int provider_index(void)
+{
+    int i = g_provider;
+    if (i < 0 || i >= PV_COUNT)
+        i = 0;
+    return i;
+}
+
+const char *net_host(void)
+{
+    return g_providers[provider_index()].host;
+}
+
+const char *provider_name(void)
+{
+    return g_providers[provider_index()].name;
+}
 
 static CURLM *s_multi = NULL;
 static bool s_global = false;
@@ -45,9 +69,9 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
     dl_t *d = (dl_t *)userdata;
     size_t total = size * nmemb;
 
-    if (d->size + total > d->cap) {
+    if ((size_t)d->size + total > d->cap) {
         u32 cap = d->cap ? d->cap : 32 * 1024;
-        while (d->size + total > cap)
+        while ((size_t)d->size + total > cap)
             cap *= 2;
         if (cap > DL_MAX_BUF)
             return 0; /* aborts the transfer */
@@ -68,7 +92,6 @@ static void set_common_opts(CURL *e, dl_t *d)
     curl_easy_setopt(e, CURLOPT_WRITEDATA, d);
     curl_easy_setopt(e, CURLOPT_ERRORBUFFER, d ? d->err : NULL);
     curl_easy_setopt(e, CURLOPT_USERAGENT, HTTP_USER_AGENT);
-    curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(e, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(e, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(e, CURLOPT_FOLLOWLOCATION, 1L);
@@ -83,7 +106,7 @@ static void set_common_opts(CURL *e, dl_t *d)
 /* incremental downloader                                              */
 /* ------------------------------------------------------------------ */
 
-dl_t *dl_start(const char *url)
+dl_t *dl_start(const char *url, bool gzip)
 {
     curl_ensure();
 
@@ -107,6 +130,8 @@ dl_t *dl_start(const char *url)
 
     curl_easy_setopt(d->easy, CURLOPT_URL, url);
     set_common_opts(d->easy, d);
+    if (gzip)
+        curl_easy_setopt(d->easy, CURLOPT_ACCEPT_ENCODING, "");
 
     if (curl_multi_add_handle(s_multi, d->easy) != CURLM_OK) {
         curl_easy_cleanup(d->easy);
@@ -132,6 +157,9 @@ int dl_pump(dl_t *d)
             break;
     }
 
+    /* the multi handle is shared, so this also harvests completions for
+       the other in-flight transfers; CURLOPT_PRIVATE routes each message
+       back to its own dl_t */
     CURLMsg *msg;
     int msgs_left = 0;
     while ((msg = curl_multi_info_read(s_multi, &msgs_left)) != NULL) {
@@ -159,13 +187,6 @@ int dl_pump(dl_t *d)
 const u8 *dl_buf(const dl_t *d)
 {
     return d ? d->buf : NULL;
-}
-
-static char s_neterr[CURL_ERROR_SIZE] = "";
-
-const char *net_err(void)
-{
-    return s_neterr;
 }
 
 u32 dl_size(const dl_t *d)
@@ -234,78 +255,39 @@ void dl_abort(dl_t *d)
     free(d);
 }
 
-/* ------------------------------------------------------------------ */
-/* one-shot blocking download (search api)                             */
+void net_exit(void)
+{
+    if (s_multi) {
+        curl_multi_cleanup(s_multi);
+        s_multi = NULL;
+    }
+    if (s_global) {
+        curl_global_cleanup();
+        s_global = false;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 
 void url_encode(const char *in, char *out, int outsz)
 {
     static const char hex[] = "0123456789ABCDEF";
     int o = 0;
-    for (; *in && o < outsz - 4; in++) {
-        unsigned char c = *in;
+    for (; *in; in++) {
+        /* worst case a character costs 3 bytes, plus the terminator */
+        if (o + 4 > outsz)
+            break;
+        unsigned char c = (unsigned char)*in;
         if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
             (c >= '0' && c <= '9') || c == '-' || c == '_' ||
             c == '.' || c == '~')
-            out[o++] = c;
+            out[o++] = (char)c;
         else {
             out[o++] = '%';
             out[o++] = hex[c >> 4];
             out[o++] = hex[c & 15];
         }
     }
-    out[o] = 0;
-}
-
-Result download(const char *url, u8 **out_buf, u32 *out_size, u32 *status_out)
-{
-    char errbuf[CURL_ERROR_SIZE];
-    errbuf[0] = 0;
-
-    curl_ensure();
-
-    Result ret = -3;
-    dl_t tmp;
-    memset(&tmp, 0, sizeof(tmp));
-    tmp.cap = 32 * 1024;
-    tmp.buf = (u8 *)malloc(tmp.cap);
-
-    CURL *e = curl_easy_init();
-    if (!tmp.buf || !e) {
-        free(tmp.buf);
-        if (e) curl_easy_cleanup(e);
-        return -1;
-    }
-
-    curl_easy_setopt(e, CURLOPT_URL, url);
-    set_common_opts(e, &tmp);
-    curl_easy_setopt(e, CURLOPT_ERRORBUFFER, errbuf);
-
-    CURLcode rc = curl_easy_perform(e);
-
-    long code = 0;
-    curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &code);
-    if (status_out)
-        *status_out = (u32)code;
-
-    snprintf(s_neterr, sizeof(s_neterr), "%s",
-             errbuf[0] ? errbuf : curl_easy_strerror(rc));
-    if (rc == CURLE_OK && code == 200 && tmp.size > 0) {
-        u8 *shrunk = (u8 *)realloc(tmp.buf, tmp.size + 1);
-        if (shrunk) {
-            tmp.buf = shrunk;
-            tmp.buf[tmp.size] = 0;
-            *out_buf = tmp.buf;
-            *out_size = tmp.size;
-            ret = 0;
-        } else {
-            free(tmp.buf);
-            ret = -1;
-        }
-    } else {
-        free(tmp.buf);
-        ret = rc != CURLE_OK ? (Result)rc : -2;
-    }
-    curl_easy_cleanup(e);
-    return ret;
+    if (outsz > 0)
+        out[o] = 0;
 }

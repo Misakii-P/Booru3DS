@@ -7,6 +7,11 @@
 
 #include "imgtex.h"
 
+/* worst case the callers can hand us: a 400x240 big view padded to
+   512x256 by next_pow2 */
+#define PAD_MAX_W 512
+#define PAD_MAX_H 256
+
 static u32 next_pow2(u32 v)
 {
     u32 r = 8;
@@ -29,43 +34,39 @@ static const u8 SRC2DST[64] = {
 };
 
 /* RGBA -> tiled texture. Padding is edge-replicated so GPU_LINEAR sampling
-   at the subrect border blends with real pixels instead of black zeros */
+   at the subrect border blends with real pixels instead of black zeros.
+
+   The replication reads straight out of the source with clamped
+   coordinates, so no padded copy of the image is materialised in between
+   - that used to cost a 512KB scratch buffer and a second full pass over
+   every pixel. */
 static bool imgtex_common(C3D_Tex *tex, Tex3DS_SubTexture *sub,
                           const u8 *rgba, int w, int h, bool fmt565)
 {
-    u32 wp = next_pow2(w), hp = next_pow2(h);
-
-    /* static scratch: worst case 512x256 (400x240 big view + padding),
-       avoids heap churn and fragmentation on old3ds */
-    static u8 s_pad[512 * 256 * 4];
-    if (wp > 512 || hp > 256)
+    if (w <= 0 || h <= 0)
         return false;
 
-    /* padded source with edge replication */
-    u8 *pad = s_pad;
-    for (u32 y = 0; y < hp; y++) {
-        const u8 *row = rgba + (size_t)(y < (u32)h ? y : h - 1) * w * 4;
-        for (u32 x = 0; x < wp; x++)
-            memcpy(pad + (y * wp + x) * 4,
-                   row + (size_t)(x < (u32)w ? x : w - 1) * 4, 4);
-    }
+    u32 wp = next_pow2((u32)w), hp = next_pow2((u32)h);
+    if (wp > PAD_MAX_W || hp > PAD_MAX_H)
+        return false;
 
     if (!C3D_TexInit(tex, wp, hp, fmt565 ? GPU_RGB565 : GPU_RGBA8))
         return false;
     C3D_TexSetFilter(tex, GPU_LINEAR, GPU_LINEAR);
     C3D_TexSetWrap(tex, GPU_CLAMP_TO_BORDER, GPU_CLAMP_TO_BORDER);
     tex->border = 0;
-    memset(tex->data, 0, wp * hp * (fmt565 ? 2 : 4));
+    /* no pre-clear: the loops below write every texel of the pow2 rect */
 
     if (fmt565) {
         u16 *dst = (u16 *)tex->data;
         for (u32 y = 0; y < hp; y++) {
-            int ty = y >> 3;
-            int lin = (y & 7) << 3;
-            const u8 *src = pad + y * wp * 4;
+            u32 ty = y >> 3;
+            u32 lin = (y & 7) << 3;
+            u32 sy = y < (u32)h ? y : (u32)h - 1;
+            const u8 *row = rgba + (size_t)sy * w * 4;
             for (u32 x = 0; x < wp; x++) {
-                const u8 *px = src + x * 4;
-                u32 off = (((ty * (int)(wp >> 3)) + (int)(x >> 3)) << 6)
+                const u8 *px = row + (size_t)(x < (u32)w ? x : (u32)w - 1) * 4;
+                u32 off = (((ty * (wp >> 3)) + (x >> 3)) << 6)
                         + SRC2DST[lin + (x & 7)];
                 dst[off] = (u16)((px[0] >> 3) << 11 | (px[1] >> 2) << 5
                                | (px[2] >> 3));
@@ -75,12 +76,13 @@ static bool imgtex_common(C3D_Tex *tex, Tex3DS_SubTexture *sub,
         /* texels are stored [A,B,G,R] in memory */
         u32 *dst = (u32 *)tex->data;
         for (u32 y = 0; y < hp; y++) {
-            int ty = y >> 3;
-            int lin = (y & 7) << 3;
-            const u8 *src = pad + y * wp * 4;
+            u32 ty = y >> 3;
+            u32 lin = (y & 7) << 3;
+            u32 sy = y < (u32)h ? y : (u32)h - 1;
+            const u8 *row = rgba + (size_t)sy * w * 4;
             for (u32 x = 0; x < wp; x++) {
-                const u8 *px = src + x * 4;
-                u32 off = (((ty * (int)(wp >> 3)) + (int)(x >> 3)) << 6)
+                const u8 *px = row + (size_t)(x < (u32)w ? x : (u32)w - 1) * 4;
+                u32 off = (((ty * (wp >> 3)) + (x >> 3)) << 6)
                         + SRC2DST[lin + (x & 7)];
                 dst[off] = (u32)px[0] << 24 | (u32)px[1] << 16
                          | (u32)px[2] << 8 | (u32)px[3];

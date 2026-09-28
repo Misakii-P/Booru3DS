@@ -29,6 +29,8 @@
 #define CAM_MAX_W 640
 #define CAM_MAX_H 480
 
+static tjhandle s_dec, s_enc;
+
 static struct
 {
     SaveState st;
@@ -53,6 +55,8 @@ void save_init(void)
 {
     mkdir(SAVE_DIR_A, 0777);
     mkdir(SAVE_DIR_B, 0777);
+    if (!s_dec) s_dec = tjInitDecompress();
+    if (!s_enc) s_enc = tjInitCompress();
 }
 
 static void finish(bool keep)
@@ -73,6 +77,14 @@ void save_exit(void)
 {
     finish(true);
     s.st = SAVE_IDLE;
+    if (s_dec) {
+        tjDestroy(s_dec);
+        s_dec = NULL;
+    }
+    if (s_enc) {
+        tjDestroy(s_enc);
+        s_enc = NULL;
+    }
 }
 
 void save_reset(void)
@@ -267,12 +279,16 @@ static bool write_camera_jpeg(FILE *f, const unsigned char *jpg,
     }
     if (fwrite(jpg, 1, ins, f) != ins)
         return false;
-    unsigned char hdr[3] = {
-        0xE1,
+    /* APP1 is a two-byte marker: 0xFF 0xE1, then the segment length.
+       Writing only 0xE1 produced a file that still decoded as an image
+       but that the camera's EXIF reader skipped entirely, so every photo
+       came out dated at the camera's floor date. */
+    unsigned char hdr[4] = {
+        0xFF, 0xE1,
         (unsigned char)(((exiflen + 2) >> 8) & 0xFF),
         (unsigned char)((exiflen + 2) & 0xFF),
     };
-    if (fwrite(hdr, 1, 3, f) != 3) return false;
+    if (fwrite(hdr, 1, 4, f) != 4) return false;
     if (fwrite(exif, 1, exiflen, f) != exiflen) return false;
     return fwrite(jpg + copyFrom, 1, sz - copyFrom, f) == sz - copyFrom;
 }
@@ -282,22 +298,30 @@ static bool write_camera_jpeg(FILE *f, const unsigned char *jpg,
    silently refuses to index. */
 static bool camera_encode(u8 *jpg, u32 sz, const char *path)
 {
-    static tjhandle s_dec = NULL, s_enc = NULL;
-    if (!s_dec)
-        s_dec = tjInitDecompress();
-    if (!s_enc)
-        s_enc = tjInitCompress();
+    /* normally created by save_init(); re-created here in case init failed
+       or something tore them down, since without both of these every
+       camera install would just report a failure */
+    if (!s_dec) s_dec = tjInitDecompress();
+    if (!s_enc) s_enc = tjInitCompress();
     if (!s_dec || !s_enc)
         return false;
 
-    static u8 s_rgba[CAM_MAX_W * CAM_MAX_H * 4];
-    const u8 *enc_src = s_rgba;
+    /* 640x480x4 - by far the largest buffer in the app, and idle outside
+       of a camera install, so it is taken from the heap on demand rather
+       than parked in BSS for the whole session */
+    u8 *rgba = (u8 *)malloc(CAM_MAX_W * CAM_MAX_H * 4);
+    if (!rgba)
+        return false;
+
+    const u8 *enc_src = rgba;
+    u8 *dec = NULL;   /* stb-owned decode buffer, released at done: */
     int W = 0, H = 0, dw = 0, dh = 0;
+    bool ok = false;
 
     if (sz >= 3 && jpg[0] == 0xFF && jpg[1] == 0xD8 && jpg[2] == 0xFF) {
         /* jpeg input: scale-decode (also converts progressive -> baseline) */
         if (tjDecompressHeader(s_dec, jpg, sz, &W, &H) || W <= 0 || H <= 0)
-            return false;
+            goto done;
 
         int num = 1, den = 1, nsf = 0;
         tjscalingfactor *sf = tjGetScalingFactors(&nsf);
@@ -314,11 +338,14 @@ static bool camera_encode(u8 *jpg, u32 sz, const char *path)
         }
         dw = (W * num + den - 1) / den;
         dh = (H * num + den - 1) / den;
+        /* no scale factor fit: dw/dh are still the full image and would
+           overrun the buffer above */
         if (dw > CAM_MAX_W || dh > CAM_MAX_H)
-            return false;
-        if (tjDecompress2(s_dec, jpg, sz, s_rgba, dw, 0, dh, TJPF_RGBA,
+            goto done;
+        if (tjDecompress2(s_dec, jpg, sz, rgba, dw, 0, dh, TJPF_RGBA,
                           TJFLAG_FASTDCT))
-            return false;
+            goto done;
+        enc_src = rgba;
     } else {
         /* png/bmp/etc via stb_image, then shrink to fit 640x480 */
         int comp = 0;
@@ -330,14 +357,13 @@ static bool camera_encode(u8 *jpg, u32 sz, const char *path)
             if (!stbi_info_from_memory(jpg, (int)sz, &pw, &ph, &pc) ||
                 pw <= 0 || ph <= 0 ||
                 (long long)pw * ph > (long long)CAM_MAX_W * CAM_MAX_H)
-                return false;
+                goto done;
         }
 
         u8 *src = stbi_load_from_memory(jpg, (int)sz, &W, &H, &comp, 4);
-        if (!src || W <= 0 || H <= 0) {
-            free(src);
-            return false;
-        }
+        if (!src || W <= 0 || H <= 0)
+            goto done;
+        dec = src;
 
         dw = W; dh = H;
         if (dw > CAM_MAX_W || dh > CAM_MAX_H) {
@@ -352,46 +378,53 @@ static bool camera_encode(u8 *jpg, u32 sz, const char *path)
                 int sy = y * H / dh;
                 for (int x = 0; x < dw; x++) {
                     int sx = x * W / dw;
-                    memcpy(s_rgba + ((size_t)y * dw + x) * 4,
+                    memcpy(rgba + ((size_t)y * dw + x) * 4,
                            src + ((size_t)sy * W + sx) * 4, 4);
                 }
             }
-            enc_src = s_rgba;
+            enc_src = rgba;
         } else {
+            /* encode straight out of the stb buffer. It has to stay
+               alive until tjCompress2 has run below - freeing it here
+               left enc_src dangling, which is the common case since the
+               size pre-check above already rules out anything larger. */
             enc_src = src;
         }
-        stbi_image_free(src);
     }
 
-    unsigned long outcap = tjBufSize(dw, dh, TJSAMP_420);
-    unsigned char *out = tjAlloc(outcap);
-    bool ok = false;
-    if (out) {
-        unsigned long outsize = outcap;
-        if (tjCompress2(s_enc, enc_src, dw, 0, dh, TJPF_RGBA,
-                        &out, &outsize, TJSAMP_420, 85,
-                        TJFLAG_FASTDCT) == 0) {
-            FILE *f = fopen(path, "wb");
-            if (f) {
-                ok = write_camera_jpeg(f, out, outsize);
-                fclose(f);
+    {
+        unsigned long outcap = tjBufSize(dw, dh, TJSAMP_420);
+        unsigned char *out = tjAlloc(outcap);
+        if (out) {
+            unsigned long outsize = outcap;
+            if (tjCompress2(s_enc, enc_src, dw, 0, dh, TJPF_RGBA,
+                            &out, &outsize, TJSAMP_420, 85,
+                            TJFLAG_FASTDCT) == 0) {
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    ok = write_camera_jpeg(f, out, outsize);
+                    fclose(f);
+                }
+                /* the camera may fall back to the file's modification date:
+                   stamp it explicitly so imported photos show download time.
+                   time() can return -1 on 3DS if RTC is unset, which would
+                   clamp to the FAT minimum (1980/2001) - use a sane fallback. */
+                if (ok) {
+                    time_t now = time(NULL);
+                    if (now == (time_t)-1 || now < 1262304000)
+                        now = 1704067200; /* 2024-01-01 */
+                    struct utimbuf ub;
+                    ub.actime = ub.modtime = now;
+                    utime(path, &ub);
+                }
             }
-            /* the camera may fall back to the file's modification date:
-               stamp it explicitly so imported photos show download time.
-               time() can return -1 on 3DS if RTC is unset, which would
-               clamp to the FAT minimum (1980/2001) - use a sane fallback. */
-            if (ok) {
-                time_t now = time(NULL);
-                if (now == (time_t)-1 || now < 1262304000)
-                    now = 1704067200; /* 2024-01-01 */
-                struct utimbuf ub;
-                ub.actime = ub.modtime = now;
-                utime(path, &ub);
-            }
+            tjFree(out);
         }
-        tjFree(out);
     }
 
+done:
+    stbi_image_free(dec);
+    free(rgba);
     return ok;
 }
 
@@ -405,15 +438,15 @@ static void build_url(int post, char *out, int outsz)
         if (!strncmp(cand, "//", 2))
             snprintf(out, outsz, "https:%s", cand);
         else if (cand[0] == '/')
-            snprintf(out, outsz, "https://safebooru.org%s", cand);
+            snprintf(out, outsz, "https://%s%s", net_host(), cand);
         else
             snprintf(out, outsz, "%s", cand);
         return;
     }
     if (p->image[0]) {
         snprintf(out, outsz,
-                 "https://safebooru.org/images/%s/%s",
-                 p->directory, p->image);
+                 "https://%s/images/%s/%s",
+                 net_host(), p->directory, p->image);
         return;
     }
     out[0] = 0;
@@ -431,6 +464,14 @@ void save_request(int post, SaveDest dest)
         return;
     }
 
+    /* never inherit a handle or a path from an earlier save: a stale path
+       would silently overwrite the previously installed photo */
+    if (s.fp) {
+        fclose(s.fp);
+        s.fp = NULL;
+    }
+    s.path[0] = 0;
+
     if (dest == SAVE_DEST_BOORU) {
         build_booru_path(post, s.path, sizeof(s.path));
         s.fp = fopen(s.path, "wb");
@@ -439,13 +480,17 @@ void save_request(int post, SaveDest dest)
             return;
         }
     } else {
-        build_camera_path(s.path, sizeof(s.path));
-        s.fp = NULL;
+        /* all 900 camera folders full: bail out rather than fall through
+           with a path we never filled in */
+        if (!build_camera_path(s.path, sizeof(s.path))) {
+            s.st = SAVE_ERR;
+            return;
+        }
     }
 
     s.dest = dest;
     s.bytes = 0;
-    s.dl = dl_start(url);
+    s.dl = dl_start(url, false);
     if (!s.dl) {
         finish(false);
         s.st = SAVE_ERR;

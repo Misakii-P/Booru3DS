@@ -8,7 +8,6 @@ typedef struct {
     unsigned int id;
     char directory[64];
     char image[128];
-    char tags[192];
     char preview[256];
     char sample[256];
     char file[256];

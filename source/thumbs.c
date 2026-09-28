@@ -12,11 +12,19 @@
 #include "net.h"
 #include "posts.h"
 #include "imgtex.h"
-#include "bigview.h"
 #include "thumbs.h"
 
-#define THUMB_MAX_DIM 112
-#define MAX_THUMBS    12
+#define THUMB_MAX_DIM  112
+#define THUMB_MAX_EDGE 128 /* must match the decode scratch below */
+#define MAX_THUMBS     12
+/* Wall-clock here is network latency, not bandwidth: a cold TLS connect to
+   safebooru costs a few hundred ms, so a page of twelve thumbs is
+   dominated by how many handshakes are in flight at once rather than by
+   throughput. Three keeps the SOC buffer and the per-frame decode budget
+   comfortable while cutting page-fill time to roughly a third. */
+#define THUMB_CONCURRENT    3
+#define THUMB_RETRY_FRAMES  300 /* ~5s at 60fps */
+#define THUMB_MAX_TRIES     3    /* give up so page changes can proceed */
 
 typedef enum { T_EMPTY, T_QUEUE, T_ACTIVE, T_READY, T_FAIL } TState;
 
@@ -25,6 +33,8 @@ typedef struct
     int post;
     TState st;
     u32 stamp;
+    u8 tries; /* consecutive failures; past THUMB_MAX_TRIES this slot
+                 stops holding up a page change */
     C3D_Tex tex;
     Tex3DS_SubTexture sub;
     dl_t *dl;
@@ -32,11 +42,22 @@ typedef struct
 
 static Slot s_slots[MAX_THUMBS];
 static u32 s_frame = 1;
-static int s_ok = 0;
 static int s_page = -1;
+static tjhandle s_tj;
 
-void thumbs_init(void) {}
-void thumbs_exit(void) {}
+void thumbs_init(void)
+{
+    s_tj = tjInitDecompress();
+}
+
+void thumbs_exit(void)
+{
+    thumbs_reset();
+    if (s_tj) {
+        tjDestroy(s_tj);
+        s_tj = NULL;
+    }
+}
 
 void thumbs_reset(void)
 {
@@ -48,7 +69,6 @@ void thumbs_reset(void)
             C3D_TexDelete(&s->tex);
         memset(s, 0, sizeof(*s));
     }
-    s_ok = 0;
     s_page = -1;
 }
 
@@ -66,18 +86,6 @@ bool thumb_get(int post, C3D_Tex **tex, const Tex3DS_SubTexture **sub)
     return false;
 }
 
-void thumbs_stats(int *ok, int *pending)
-{
-    int pend = 0;
-    for (int i = 0; i < MAX_THUMBS; i++)
-        if (s_slots[i].st == T_QUEUE || s_slots[i].st == T_ACTIVE)
-            pend++;
-    if (ok)
-        *ok = s_ok;
-    if (pending)
-        *pending = pend;
-}
-
 /* ------------------------------------------------------------------ */
 
 static void build_url(int post, char *out, int outsz)
@@ -87,26 +95,23 @@ static void build_url(int post, char *out, int outsz)
         if (!strncmp(p->preview, "//", 2))
             snprintf(out, outsz, "https:%s", p->preview);
         else if (p->preview[0] == '/')
-            snprintf(out, outsz, "https://safebooru.org%s", p->preview);
+            snprintf(out, outsz, "https://%s%s", net_host(), p->preview);
         else
             snprintf(out, outsz, "%s", p->preview);
         return;
     }
     snprintf(out, outsz,
-             "https://safebooru.org/thumbnails/%s/thumbnail_%s",
-             p->directory, p->image);
+             "https://%s/thumbnails/%s/thumbnail_%s",
+             net_host(), p->directory, p->image);
 }
 
 static bool decode_thumb(u8 *jpg, u32 sz, C3D_Tex *tex, Tex3DS_SubTexture *sub)
 {
-    static tjhandle s_tj = NULL;
-    if (!s_tj)
-        s_tj = tjInitDecompress();
     if (!s_tj)
         return false;
 
     /* decoded thumb never exceeds 112x112 (static scratch, no heap churn) */
-    static u8 s_rgba[128 * 128 * 4];
+    static u8 s_rgba[THUMB_MAX_EDGE * THUMB_MAX_EDGE * 4];
 
     bool ok = false;
     int W = 0, H = 0;
@@ -127,7 +132,9 @@ static bool decode_thumb(u8 *jpg, u32 sz, C3D_Tex *tex, Tex3DS_SubTexture *sub)
         int dw = (W * num + den - 1) / den;
         int dh = (H * num + den - 1) / den;
 
-        if (dw <= 128 && dh <= 128 &&
+        /* if no scale factor fits, num/den are still 1/1 and dw/dh are the
+           full image - refuse rather than overrun the scratch above */
+        if (dw <= THUMB_MAX_EDGE && dh <= THUMB_MAX_EDGE &&
             tjDecompress2(s_tj, jpg, sz, s_rgba, dw, 0, dh, TJPF_RGBA,
                           TJFLAG_FASTDCT) == 0)
             ok = imgtex_make565(tex, sub, s_rgba, dw, dh);
@@ -138,12 +145,10 @@ static bool decode_thumb(u8 *jpg, u32 sz, C3D_Tex *tex, Tex3DS_SubTexture *sub)
 
 static void free_slot(Slot *s)
 {
-    if (s->st == T_READY) {
+    if (s->st == T_READY)
         C3D_TexDelete(&s->tex);
-        s_ok--;
-    } else if (s->st == T_ACTIVE && s->dl) {
+    else if (s->st == T_ACTIVE && s->dl)
         dl_abort(s->dl);
-    }
     memset(s, 0, sizeof(*s));
 }
 
@@ -174,12 +179,32 @@ static Slot *find_slot(int post)
     return NULL;
 }
 
-static Slot *find_state(TState st)
+static int count_active(void)
 {
+    int n = 0;
     for (int i = 0; i < MAX_THUMBS; i++)
-        if (s_slots[i].st == st)
-            return &s_slots[i];
-    return NULL;
+        if (s_slots[i].st == T_ACTIVE)
+            n++;
+    return n;
+}
+
+/* the queued slot closest to the cursor, so the selection fills first */
+static Slot *pick_queued(int cursor)
+{
+    Slot *best = NULL;
+    int best_dist = INT_MAX;
+    for (int i = 0; i < MAX_THUMBS; i++) {
+        Slot *s = &s_slots[i];
+        if (s->st != T_QUEUE)
+            continue;
+        int dist = s->post - cursor;
+        if (dist < 0) dist = -dist;
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = s;
+        }
+    }
+    return best;
 }
 
 void thumbs_suspend(void)
@@ -219,14 +244,15 @@ void thumbs_update(int cursor)
                 s->st = T_EMPTY;
             }
         }
-        s_ok = 0;
         s_page = cur_page;
     }
 
-    /* retry failed thumbnails after a delay (5 seconds) */
+    /* retry failures after a delay, but only a few times: a post that is
+       gone for good must eventually stop blocking page changes */
     for (int i = 0; i < MAX_THUMBS; i++) {
         Slot *s = &s_slots[i];
-        if (s->st == T_FAIL && s_frame - s->stamp > 300)
+        if (s->st == T_FAIL && s->tries < THUMB_MAX_TRIES &&
+            s_frame - s->stamp > THUMB_RETRY_FRAMES)
             s->st = T_QUEUE;
     }
 
@@ -243,65 +269,56 @@ void thumbs_update(int cursor)
         s->stamp = s_frame;
     }
 
-    /* start next download (single download, prioritise cursor) */
-    if (!find_state(T_ACTIVE) && !bigview_busy()) {
-        Slot *nextq = NULL;
-        int best_dist = INT_MAX;
-        for (int i = 0; i < MAX_THUMBS; i++) {
-            Slot *s = &s_slots[i];
-            if (s->st != T_QUEUE)
-                continue;
-            int dist = s->post - cursor;
-            if (dist < 0) dist = -dist;
-            if (dist < best_dist) {
-                best_dist = dist;
-                nextq = s;
-            }
-        }
-        if (nextq) {
-            char url[512];
-            build_url(nextq->post, url, sizeof(url));
-            nextq->dl = dl_start(url);
-            nextq->st = nextq->dl ? T_ACTIVE : T_FAIL;
-            if (!nextq->dl)
-                nextq->stamp = s_frame;
+    /* Start transfers, cursor first. These deliberately keep running while
+       the big view is fetching: the two are limited by latency, not by
+       bandwidth, so serialising them just added the big view's round trip
+       to every page fill. */
+    while (count_active() < THUMB_CONCURRENT) {
+        Slot *nextq = pick_queued(cursor);
+        if (!nextq)
+            break;
+        char url[512];
+        build_url(nextq->post, url, sizeof(url));
+        nextq->dl = dl_start(url, false);
+        nextq->st = nextq->dl ? T_ACTIVE : T_FAIL;
+        if (!nextq->dl) {
+            nextq->stamp = s_frame;
+            nextq->tries++;
         }
     }
 
-    /* pump active download */
-    Slot *act = find_state(T_ACTIVE);
-    if (act && act->dl) {
-        int r = dl_pump(act->dl);
-        if (r == DL_DONE) {
-            u8 *buf = (u8 *)dl_buf(act->dl);
-            u32 sz = dl_size(act->dl);
-            bool ok = sz >= 16 && decode_thumb(buf, sz, &act->tex, &act->sub);
-            dl_abort(act->dl);
-            act->dl = NULL;
-            act->st = ok ? T_READY : T_FAIL;
-            if (ok)
-                s_ok++;
-            else
-                act->stamp = s_frame;
-        } else if (r == DL_ERR) {
-            dl_abort(act->dl);
-            act->dl = NULL;
-            act->st = T_FAIL;
-            act->stamp = s_frame;
+    /* Pump every active transfer, but decode at most one image per frame.
+       Decoding runs here on the main thread, and while it does nothing
+       else happens - including the curl_multi_perform inside dl_pump that
+       is what actually drives the network. A burst of three decodes would
+       hitch the frame and stall the transfers that had not landed yet.
+       Anything skipped stays DL_DONE and is picked up next frame. */
+    bool decoded = false;
+    for (int i = 0; i < MAX_THUMBS; i++) {
+        Slot *s = &s_slots[i];
+        if (s->st != T_ACTIVE || !s->dl)
+            continue;
+        int r = dl_pump(s->dl);
+        if (r == DL_ERR) {
+            dl_abort(s->dl);
+            s->dl = NULL;
+            s->st = T_FAIL;
+            s->stamp = s_frame;
+            s->tries++;
+            continue;
+        }
+        if (r != DL_DONE || decoded)
+            continue;
+        decoded = true;
+        u8 *buf = (u8 *)dl_buf(s->dl);
+        u32 sz = dl_size(s->dl);
+        bool ok = sz >= 16 && decode_thumb(buf, sz, &s->tex, &s->sub);
+        dl_abort(s->dl);
+        s->dl = NULL;
+        s->st = ok ? T_READY : T_FAIL;
+        if (!ok) {
+            s->stamp = s_frame;
+            s->tries++;
         }
     }
-}
-
-bool thumbs_page_ready(int cursor)
-{
-    int first = (cursor / PAGE_SIZE) * PAGE_SIZE;
-    int end = first + PAGE_SIZE;
-    if (end > post_count)
-        end = post_count;
-    for (int i = first; i < end; i++) {
-        Slot *s = find_slot(i);
-        if (!s || s->st != T_READY)
-            return false;
-    }
-    return true;
 }

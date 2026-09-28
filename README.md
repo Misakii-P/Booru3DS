@@ -14,7 +14,7 @@ straight into the Nintendo 3DS Camera app.
 
 - **Two image boards** — switch between `safebooru.org` and `konachan.net`
   with `SELECT` (both SFW).
-- **Explore images** — Browse up to 50 recently-added images from a tag;
+- **Explore images** — Browse up to 100 recently-added images from a tag;
   D-Pad / L / R / touch to navigate.
 - **Full-size viewer** — the selected post renders large on the top screen,
   first from the thumbnail cache, then sharpened when the full preview

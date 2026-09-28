@@ -12,6 +12,7 @@
 #include "save.h"
 #include "sdata.h"
 #include "bgm.h"
+#include "net.h"
 #include "ui.h"
 #include "topscreenbg_t3x.h"
 #include "topsearch_t3x.h"
@@ -35,7 +36,7 @@ static C2D_SpriteSheet s_bgsheet;      /* safebooru title bg */
 static C2D_SpriteSheet s_konachanbg;   /* konachan title bg */
 static C2D_SpriteSheet s_searchbg;     /* results screen bg */
 
-void ui_init(C3D_RenderTarget **top, C3D_RenderTarget **bot)
+bool ui_init(C3D_RenderTarget **top, C3D_RenderTarget **bot)
 {
     s_top = *top;
     s_bot = *bot;
@@ -49,6 +50,9 @@ void ui_init(C3D_RenderTarget **top, C3D_RenderTarget **bot)
     s_searchbg = C2D_SpriteSheetLoadFromMem(
         topsearch_t3x,
         (size_t)(topsearch_t3x_end - topsearch_t3x));
+    /* the backgrounds are cosmetic and every draw path already handles a
+       NULL sheet, but without a text buffer nothing can be drawn at all */
+    return s_tbuf != NULL;
 }
 
 void ui_exit(void)
@@ -66,6 +70,8 @@ void ui_exit(void)
 static void draw_text_d(float x, float y, float scale, u32 color, u32 flags,
                         float depth, const char *fmt, ...)
 {
+    if (!s_tbuf)
+        return;
     static char tmp[512];
     va_list ap;
     va_start(ap, fmt);
@@ -81,6 +87,8 @@ static void draw_text_d(float x, float y, float scale, u32 color, u32 flags,
 static void draw_text(float x, float y, float scale, u32 color, u32 flags,
                       const char *fmt, ...)
 {
+    if (!s_tbuf)
+        return;
     static char tmp[512];
     va_list ap;
     va_start(ap, fmt);
@@ -420,7 +428,7 @@ static void render_bottom(void)
         draw_text(BOT_W / 2, 60, 0.75f, COL_TEXT, C2D_AlignCenter,
                   "Booru3DS");
         draw_text(BOT_W / 2, 88, 0.42f, COL_DIM, C2D_AlignCenter,
-                  "%s", g_provider_name);
+                  "%s", provider_name());
 
         /* search bar */
         draw_search_bar(40, 104, 228, 40);
