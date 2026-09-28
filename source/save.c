@@ -12,13 +12,13 @@
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
 #define STBI_ONLY_BMP
-#define STBI_NO_STDIO
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
 #include "net.h"
 #include "posts.h"
 #include "save.h"
+#include "scaledec.h"
 
 #define SAVE_DIR_A "sdmc:/3ds"
 #define SAVE_DIR_B "sdmc:/3ds/booru"
@@ -43,6 +43,14 @@ static struct
 
 /* latched on the first successful camera install of this session */
 static bool s_cam_notice = false;
+
+/* Why the last save failed. The UI showed a bare "save failed" for every
+   distinct problem, which made them indistinguishable from the outside -
+   a 4MB transfer abort and a full camera roll looked identical. */
+static char s_err[96] = "";
+static void set_err(const char *why) { snprintf(s_err, sizeof(s_err), "%s", why); }
+
+const char *save_error(void) { return s_err; }
 
 bool save_take_cam_notice(void)
 {
@@ -296,77 +304,134 @@ static bool write_camera_jpeg(FILE *f, const unsigned char *jpg,
 /* decode ANY input and produce a small baseline jpeg the camera accepts.
    no passthrough: progressive/huge jpegs are exactly what the camera
    silently refuses to index. */
-static bool camera_encode(u8 *jpg, u32 sz, const char *path)
+/* Decode the file at path in place and overwrite it with a baseline JPEG
+   the 3DS camera will index. Reading from disk rather than from the
+   transfer buffer means the compressed original only has to be resident
+   once, and only for the formats that genuinely need it. */
+static bool camera_encode(const char *path)
 {
-    /* normally created by save_init(); re-created here in case init failed
-       or something tore them down, since without both of these every
-       camera install would just report a failure */
-    if (!s_dec) s_dec = tjInitDecompress();
-    if (!s_enc) s_enc = tjInitCompress();
-    if (!s_dec || !s_enc)
+    if (!s_dec || !s_enc) {
+        set_err("jpeg encoder unavailable");
         return false;
+    }
 
-    /* 640x480x4 - by far the largest buffer in the app, and idle outside
-       of a camera install, so it is taken from the heap on demand rather
-       than parked in BSS for the whole session */
-    u8 *rgba = (u8 *)malloc(CAM_MAX_W * CAM_MAX_H * 4);
-    if (!rgba)
+    u8 *rgba = NULL;
+    u8 *raw = NULL;   /* jpeg source, only held while turbojpeg needs it */
+    FILE *rf = fopen(path, "rb");
+    if (!rf) {
+        set_err("staged file vanished");
         return false;
+    }
+    fseek(rf, 0, SEEK_END);
+    long fsz = ftell(rf);
+    fseek(rf, 0, SEEK_SET);
+    if (fsz < 16) {
+        fclose(rf);
+        set_err("download was too small to be an image");
+        return false;
+    }
 
-    const u8 *enc_src = rgba;
-    u8 *dec = NULL;   /* stb-owned decode buffer, released at done: */
+    const u8 *enc_src = NULL;
     int W = 0, H = 0, dw = 0, dh = 0;
     bool ok = false;
+    bool is_jpeg = false;
 
-    if (sz >= 3 && jpg[0] == 0xFF && jpg[1] == 0xD8 && jpg[2] == 0xFF) {
-        /* jpeg input: scale-decode (also converts progressive -> baseline) */
-        if (tjDecompressHeader(s_dec, jpg, sz, &W, &H) || W <= 0 || H <= 0)
+    /* peek the magic without loading the file */
+    unsigned char magic[3] = { 0, 0, 0 };
+    if (fread(magic, 1, 3, rf) != 3) {
+        fclose(rf);
+        set_err("could not read staged file");
+        return false;
+    }
+    is_jpeg = (magic[0] == 0xFF && magic[1] == 0xD8 && magic[2] == 0xFF);
+    fseek(rf, 0, SEEK_SET);
+
+    if (is_jpeg) {
+        /* turbojpeg has no from-file entry point, so this one format does
+           need the compressed data in RAM. Sized exactly, with no
+           doubling slack, and released as soon as the pixels exist. */
+        raw = (u8 *)malloc((size_t)fsz);
+        if (!raw) {
+            set_err("out of memory reading the original");
             goto done;
-
-        int num = 1, den = 1, nsf = 0;
-        tjscalingfactor *sf = tjGetScalingFactors(&nsf);
-        for (int i = 0; sf && i < nsf; i++) {
-            if (sf[i].num > sf[i].denom)
-                continue;
-            int tw = (W * sf[i].num + sf[i].denom - 1) / sf[i].denom;
-            int th = (H * sf[i].num + sf[i].denom - 1) / sf[i].denom;
-            if (tw <= CAM_MAX_W && th <= CAM_MAX_H) {
-                num = sf[i].num;
-                den = sf[i].denom;
-                break;
-            }
         }
-        dw = (W * num + den - 1) / den;
-        dh = (H * num + den - 1) / den;
-        /* no scale factor fit: dw/dh are still the full image and would
-           overrun the buffer above */
-        if (dw > CAM_MAX_W || dh > CAM_MAX_H)
+        if (fread(raw, 1, (size_t)fsz, rf) != (size_t)fsz) {
+            set_err("short read on the staged original");
             goto done;
-        if (tjDecompress2(s_dec, jpg, sz, rgba, dw, 0, dh, TJPF_RGBA,
-                          TJFLAG_FASTDCT))
+        }
+
+        if (tjDecompressHeader(s_dec, raw, (unsigned long)fsz, &W, &H) ||
+            W <= 0 || H <= 0) {
+            set_err("not a decodable jpeg");
             goto done;
+        }
+
+        if (!scale_fit(W, H, CAM_MAX_W, CAM_MAX_H, &dw, &dh)) {
+            set_err("image too large for 640x480");
+            goto done;
+        }
+
+        rgba = (u8 *)malloc((size_t)dw * dh * 4);
+        if (!rgba) {
+            set_err("out of memory decoding");
+            goto done;
+        }
+        if (tjDecompress2(s_dec, raw, (unsigned long)fsz, rgba, dw, 0, dh,
+                          TJPF_RGBA, TJFLAG_FASTDCT)) {
+            set_err("jpeg too large to scale down");
+            goto done;
+        }
+        free(raw);
+        raw = NULL;
         enc_src = rgba;
     } else {
-        /* png/bmp/etc via stb_image, then shrink to fit 640x480 */
+        /* png/bmp/etc: stb reads the file itself, so the compressed data
+           never has to be in RAM at all */
         int comp = 0;
 
-        /* header pre-check: refuse monsters BEFORE stb tries to allocate
-           W*H*4 bytes (a 4500px wallpaper would attempt ~56MB) */
+        /* Sanity bound only. This used to reject anything over
+           CAM_MAX_W*CAM_MAX_H pixels, which threw away every PNG bigger
+           than ~0.3MP and made the downscale block below it dead code -
+           that is what "save failed" above roughly 1MB actually was. The
+           only thing worth refusing here is an allocation that would
+           itself be unreasonable (a 4500px wallpaper is ~56MB decoded). */
         {
             int pw = 0, ph = 0, pc = 0;
-            if (!stbi_info_from_memory(jpg, (int)sz, &pw, &ph, &pc) ||
-                pw <= 0 || ph <= 0 ||
-                (long long)pw * ph > (long long)CAM_MAX_W * CAM_MAX_H)
+            fseek(rf, 0, SEEK_SET);
+            if (!stbi_info_from_file(rf, &pw, &ph, &pc)) {
+                set_err("unsupported format (not png/jpeg/bmp)");
                 goto done;
+            }
+            if (pw <= 0 || ph <= 0) {
+                set_err("bad image header");
+                goto done;
+            }
+            if ((long long)pw * ph > 64LL * 1024 * 1024) {
+                set_err("image too large to decode safely");
+                goto done;
+            }
         }
 
-        u8 *src = stbi_load_from_memory(jpg, (int)sz, &W, &H, &comp, 4);
-        if (!src || W <= 0 || H <= 0)
+        fseek(rf, 0, SEEK_SET);
+        u8 *src = stbi_load_from_file(rf, &W, &H, &comp, 4);
+        if (!src) {
+            set_err("stb could not decode this image");
             goto done;
-        dec = src;
+        }
+        if (W <= 0 || H <= 0) {
+            stbi_image_free(src);
+            set_err("bad image dimensions");
+            goto done;
+        }
 
         dw = W; dh = H;
         if (dw > CAM_MAX_W || dh > CAM_MAX_H) {
+            rgba = (u8 *)malloc((size_t)dw * dh * 4);
+            if (!rgba) {
+                stbi_image_free(src);
+                set_err("out of memory downscaling");
+                goto done;
+            }
             int sw = (CAM_MAX_W * 256) / dw;
             int sh = (CAM_MAX_H * 256) / dh;
             int scale = sw < sh ? sw : sh;
@@ -384,15 +449,14 @@ static bool camera_encode(u8 *jpg, u32 sz, const char *path)
             }
             enc_src = rgba;
         } else {
-            /* encode straight out of the stb buffer. It has to stay
-               alive until tjCompress2 has run below - freeing it here
-               left enc_src dangling, which is the common case since the
-               size pre-check above already rules out anything larger. */
             enc_src = src;
         }
+        stbi_image_free(src);
     }
+    fclose(rf);
+    rf = NULL;
 
-    {
+    if (enc_src) {
         unsigned long outcap = tjBufSize(dw, dh, TJSAMP_420);
         unsigned char *out = tjAlloc(outcap);
         if (out) {
@@ -401,8 +465,11 @@ static bool camera_encode(u8 *jpg, u32 sz, const char *path)
                             &out, &outsize, TJSAMP_420, 85,
                             TJFLAG_FASTDCT) == 0) {
                 FILE *f = fopen(path, "wb");
-                if (f) {
+                if (!f) {
+                    set_err("cannot rewrite the staged file");
+                } else {
                     ok = write_camera_jpeg(f, out, outsize);
+                    if (!ok) set_err("exif splice failed");
                     fclose(f);
                 }
                 /* the camera may fall back to the file's modification date:
@@ -423,7 +490,8 @@ static bool camera_encode(u8 *jpg, u32 sz, const char *path)
     }
 
 done:
-    stbi_image_free(dec);
+    if (rf) fclose(rf);
+    free(raw);
     free(rgba);
     return ok;
 }
@@ -460,6 +528,7 @@ void save_request(int post, SaveDest dest)
     char url[512];
     build_url(post, url, sizeof(url));
     if (!url[0]) {
+        set_err("no download url for this post");
         s.st = SAVE_ERR;
         return;
     }
@@ -476,6 +545,7 @@ void save_request(int post, SaveDest dest)
         build_booru_path(post, s.path, sizeof(s.path));
         s.fp = fopen(s.path, "wb");
         if (!s.fp) {
+            set_err("cannot write to sdmc:/DCIM");
             s.st = SAVE_ERR;
             return;
         }
@@ -483,6 +553,15 @@ void save_request(int post, SaveDest dest)
         /* all 900 camera folders full: bail out rather than fall through
            with a path we never filled in */
         if (!build_camera_path(s.path, sizeof(s.path))) {
+            set_err("camera roll is full (900 folders)");
+            s.st = SAVE_ERR;
+            return;
+        }
+        /* the original is streamed here first and then overwritten in
+           place with the converted JPEG */
+        s.fp = fopen(s.path, "wb");
+        if (!s.fp) {
+            set_err("cannot write to sdmc:/DCIM");
             s.st = SAVE_ERR;
             return;
         }
@@ -490,8 +569,10 @@ void save_request(int post, SaveDest dest)
 
     s.dest = dest;
     s.bytes = 0;
+    s_err[0] = 0;
     s.dl = dl_start(url, false);
     if (!s.dl) {
+        set_err("download could not start");
         finish(false);
         s.st = SAVE_ERR;
         return;
@@ -511,6 +592,7 @@ void save_pump(void)
         const u8 *buf = dl_buf(s.dl);
         if (total > 0 && s.fp) {
             if (fwrite(buf, 1, total, s.fp) != total) {
+                set_err("SD write failed");
                 finish(false);
                 s.st = SAVE_ERR;
                 return;
@@ -524,26 +606,51 @@ void save_pump(void)
             finish(true);
             s.st = SAVE_OK;
         } else if (r == DL_ERR) {
+            set_err(dl_err(s.dl));
             finish(false); /* remove partial file */
             s.st = SAVE_ERR;
         }
         return;
     }
 
-    /* camera: buffer whole file, then decode+re-encode once complete */
-    s.bytes = total;
+    /* Camera: stream the original to disk first, exactly like the booru
+       target does, then decode it from the file. Buffering it in RAM was
+       the reason big originals failed - the transfer buffer grows by
+       doubling so it can hold nearly twice the file, on top of the
+       decode scratch, and old3DS does not have that much spare. On disk
+       costs nothing and the dl buffer stays at one chunk. */
+    if (s.fp) {
+        const u8 *buf = dl_buf(s.dl);
+        if (total > 0) {
+            if (fwrite(buf, 1, total, s.fp) != total) {
+                set_err("SD write failed");
+                finish(false);
+                s.st = SAVE_ERR;
+                return;
+            }
+            s.bytes += total;
+            dl_consume(s.dl, total);
+        }
+    }
     if (r == DL_DONE) {
-        u8 *buf = (u8 *)dl_buf(s.dl);
-        u32 sz = dl_size(s.dl);
-        bool ok = sz >= 16 && camera_encode(buf, sz, s.path);
-        dl_abort(s.dl);
-        s.dl = NULL;
+        if (s.fp) {
+            fclose(s.fp);
+            s.fp = NULL;
+        }
+        bool ok = camera_encode(s.path);
+        if (!ok && !s_err[0])
+            set_err("decode/encode failed (unsupported or corrupt)");
+        if (s.dl) {
+            dl_abort(s.dl);
+            s.dl = NULL;
+        }
         if (!ok)
             remove(s.path); /* don't leave a broken photo in the roll */
         s.st = ok ? SAVE_OK : SAVE_ERR;
         if (ok)
             s_cam_notice = true;
     } else if (r == DL_ERR) {
+        set_err(dl_err(s.dl));
         finish(false);
         s.st = SAVE_ERR;
     }

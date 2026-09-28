@@ -10,6 +10,7 @@
 #include "net.h"
 #include "posts.h"
 #include "imgtex.h"
+#include "scaledec.h"
 #include "bigview.h"
 
 #define BIG_MAX_W 400
@@ -105,7 +106,16 @@ bool bigview_get(int post, C3D_Tex **tex, const Tex3DS_SubTexture **sub)
 static void build_url(int post, char *out, int outsz)
 {
     Post *p = &posts[post];
-    const char *cand = p->sample[0] ? p->sample : p->file;
+
+    /* Only trust sample_url when the provider says it really is a sample.
+       safebooru fills it in even for sample:false, where it points at the
+       full original - fetching that to paint a 400x240 area is both far too
+       slow and too big to scale-decode, and it used to surface as
+       "http 200" failures on the top screen. */
+    const char *cand = (p->sample_ok && p->sample[0]) ? p->sample : NULL;
+    if (!cand)
+        cand = p->preview[0] ? p->preview : p->file;
+
     if (!cand || !cand[0]) {
         out[0] = 0;
         return;
@@ -128,27 +138,8 @@ static bool decode_big(u8 *jpg, u32 sz, C3D_Tex *tex, Tex3DS_SubTexture *sub)
     if (tjDecompressHeader(s_tj, jpg, sz, &W, &H) != 0 || W <= 0 || H <= 0)
         return false;
 
-    int num = 1, den = 1, nsf = 0;
-    tjscalingfactor *sf = tjGetScalingFactors(&nsf);
-    for (int i = 0; sf && i < nsf; i++) {
-        if (sf[i].num > sf[i].denom)
-            continue;
-        int dw = (W * sf[i].num + sf[i].denom - 1) / sf[i].denom;
-        int dh = (H * sf[i].num + sf[i].denom - 1) / sf[i].denom;
-        if (dw <= BIG_MAX_W && dh <= BIG_MAX_H) {
-            num = sf[i].num;
-            den = sf[i].denom;
-            break;
-        }
-    }
-    int dw = (W * num + den - 1) / den;
-    int dh = (H * num + den - 1) / den;
-
-    /* When no scale factor fits - anything taller than 1920 or wider than
-       3200, which is most full-size originals - num/den are still 1/1 and
-       dw/dh are the full image. Decoding that into a screen-sized buffer
-       overruns it by orders of magnitude, so refuse instead. */
-    if (dw > BIG_MAX_W || dh > BIG_MAX_H)
+    int dw = 0, dh = 0;
+    if (!scale_fit(W, H, BIG_MAX_W, BIG_MAX_H, &dw, &dh))
         return false;
 
     /* sized to the actual decode rather than the worst case, and freed

@@ -12,6 +12,7 @@
 #include "net.h"
 #include "posts.h"
 #include "imgtex.h"
+#include "scaledec.h"
 #include "thumbs.h"
 
 #define THUMB_MAX_DIM  112
@@ -116,25 +117,11 @@ static bool decode_thumb(u8 *jpg, u32 sz, C3D_Tex *tex, Tex3DS_SubTexture *sub)
     bool ok = false;
     int W = 0, H = 0;
     if (tjDecompressHeader(s_tj, jpg, sz, &W, &H) == 0 && W > 0 && H > 0) {
-        int num = 1, den = 1, nsf = 0;
-        tjscalingfactor *sf = tjGetScalingFactors(&nsf);
-        for (int i = 0; sf && i < nsf; i++) {
-            if (sf[i].num > sf[i].denom)
-                continue;
-            int dw = (W * sf[i].num + sf[i].denom - 1) / sf[i].denom;
-            int dh = (H * sf[i].num + sf[i].denom - 1) / sf[i].denom;
-            if (dw <= THUMB_MAX_DIM && dh <= THUMB_MAX_DIM) {
-                num = sf[i].num;
-                den = sf[i].denom;
-                break;
-            }
-        }
-        int dw = (W * num + den - 1) / den;
-        int dh = (H * num + den - 1) / den;
-
-        /* if no scale factor fits, num/den are still 1/1 and dw/dh are the
-           full image - refuse rather than overrun the scratch above */
-        if (dw <= THUMB_MAX_EDGE && dh <= THUMB_MAX_EDGE &&
+        int dw = 0, dh = 0;
+        /* refuses rather than decoding at 1/1, which would overrun the
+           scratch above - see scale_fit() */
+        if (scale_fit(W, H, THUMB_MAX_DIM, THUMB_MAX_DIM, &dw, &dh) &&
+            dw <= THUMB_MAX_EDGE && dh <= THUMB_MAX_EDGE &&
             tjDecompress2(s_tj, jpg, sz, s_rgba, dw, 0, dh, TJPF_RGBA,
                           TJFLAG_FASTDCT) == 0)
             ok = imgtex_make565(tex, sub, s_rgba, dw, dh);

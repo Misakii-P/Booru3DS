@@ -107,6 +107,16 @@ static const char *jval(const char *p, char *out, int outsz)
     return p;
 }
 
+/* JSON boolean. Both providers send it bare, but accept a quoted form
+   too rather than silently treating "true" as false. */
+static const char *jbool(const char *p, bool *out)
+{
+    char tmp[8];
+    p = jval(p, tmp, sizeof(tmp));
+    *out = (tmp[0] == 't' || tmp[0] == 'T' || tmp[0] == '1');
+    return p;
+}
+
 /* id field: quoted on some providers, bare on others */
 static const char *juint(const char *p, unsigned int *out)
 {
@@ -121,6 +131,7 @@ static const char *juint(const char *p, unsigned int *out)
 static const char *parse_object(const char *ob, Post *post)
 {
     memset(post, 0, sizeof(*post));
+    post->sample_ok = true; /* only an explicit false demotes it */
     if (*ob != '{')
         return ob;
     ob++;
@@ -148,6 +159,8 @@ static const char *parse_object(const char *ob, Post *post)
         p = skip_ws(p);
 
         if (!strcmp(key, "id")) p = juint(p, &post->id);
+        else if (!strcmp(key, "sample")) p = jbool(p, &post->sample_ok);
+        else if (!strcmp(key, "has_sample")) p = jbool(p, &post->sample_ok);
         else if (!strcmp(key, "directory")) p = jval(p, post->directory, sizeof(post->directory));
         else if (!strcmp(key, "image")) p = jval(p, post->image, sizeof(post->image));
         else if (!strcmp(key, "preview_url")) p = jval(p, post->preview, sizeof(post->preview));

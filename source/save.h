@@ -12,3 +12,4 @@ void save_pump(void);
 SaveState save_state(void);
 u32 save_bytes(void);
 bool save_take_cam_notice(void); /* consumed on first camera success */
+const char *save_error(void);      /* why the last save failed, "" if none */
